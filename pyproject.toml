@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtscripts"
+version = "0.1.0"
+description = "Small, explicit tools for current MTS2D simulations"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+energy = ["numpy", "sympy"]
+mesh = ["numpy", "meshio"]
+
+[project.scripts]
+mts = "mtscripts.cli:main"
+
+[tool.setuptools.package-data]
+mtscripts = ["defaults.json"]
+
+[tool.setuptools.packages.find]
+include = ["mtscripts*"]
