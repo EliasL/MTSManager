@@ -130,8 +130,9 @@ when resuming. Every execution attempt has a UUID. The build record contains the
 main-branch revision, source digest, executable checksum, build options, and CMake
 cache checksum. Each attempt records the scripts checksum, exact command, host,
 site, campaign, input checksum, timing, process/scheduler identifiers and outcome.
-The initial simulator config is immutable; no automatic checkpoint selection,
-settings overrides, or executable replacement is performed.
+The initial simulator config is immutable. Latest-checkpoint selection is only
+enabled explicitly with `--checkpoint latest` or a job chain; settings and the
+executable are never replaced automatically.
 
 An indexed lookup uses only the hash, so human labels are not needed to find a run:
 
@@ -202,12 +203,39 @@ python -m mtscripts logs '/absolute/run/attempts/ID' --site pascal --follow
 python -m mtscripts stop '/absolute/run/attempts/ID' --site pascal
 python -m mtscripts run original.conf --site pascal \
   --checkpoint '/absolute/run/dumps/checkpoint.xml.gz'
+
+# Queue three allocations of the same run, in sequence (Slurm only).
+python -m mtscripts run original.conf --site magi --chain 3
+
+# Explicitly resume the newest dump when this job actually starts.
+python -m mtscripts run original.conf --site magi --checkpoint latest
 ```
 
 Resume requires an unchanged configuration, the original executable, and a
 checkpoint inside that managed output folder. The saved input is checksummed
 again immediately before execution. Stop uses `scancel` or a verified process
 identity, never broad name matching.
+
+`--chain N` is the total number of allocations per simulation, including the
+first; it also works with `campaign`. The Python API accepts `submit(..., chain=N)`.
+Each follow-up uses Slurm `afterany` on its predecessor, so a time limit does not
+break the dependency. Chains require `writeDumps=true`; enable
+`checkpointInterval` to bound lost work between saves. At worker startup, while
+holding the run lock, the newest `dumps/*.xml.gz` by modification time is selected
+and its path, checksum and resolved run identity are recorded before MTS2D loads
+it. The simulator restores the saved counters; if the target is already met,
+it performs no more loading steps. Normal duplicate-submission guards still apply
+outside an explicitly requested chain. Keep configs, executable and scripts
+unchanged for the entire chain.
+
+Continuations accept completed, timed-out, preempted or node-failed predecessors;
+cancellation, unexpected failure, missing checkpoints and corrupt dumps are
+errors, rather than a fresh restart or silent fallback to an older state.
+Every allocation has its own attempt, logs and journal events. Inventory exposes
+all attempts, and status shows the running attempt ahead of queued continuations.
+No new jobs are submitted at runtime: the requested chain is queued upfront.
+If submission is interrupted, inspect the remote journal and queue before
+retrying because a prefix of the chain may already have been submitted.
 
 Slurm queue state and worker state are displayed separately. A hard-killed worker
 or unreachable host cannot reliably record its final event: the overview shows
@@ -243,6 +271,21 @@ silently repaired. There is no always-running synchronization daemon.
 
 ## Data and fast storage estimates
 
+Each simulation uses one fixed CSV header, including across resumes. Register
+new diagnostics before initialization; changing the schema while writing or
+resuming raises an error before the existing CSV is modified. Readers select
+fields by header name and preserve additional columns, so adding diagnostics
+for new simulations does not require a fixed field list or legacy aliases.
+
+New simulator builds export numeric cumulative `tangent_preparation_time_s`,
+including stiffness assembly, factorization and unsuccessful preparation
+attempts. It stays flat on reuse and survives checkpoint resumes; consecutive
+row differences give per-step preparation cost in seconds. It is included in
+`minimization_time`, so subtract it when comparing minimization without
+preparation. The accompanying cumulative `preconditioner_builds`,
+`preconditioner_reuses` and `preconditioner_fallbacks` counters identify rebuilds,
+reuse and failed builds. Initialization uses no tangent preparation.
+
 ```sh
 python -m mtscripts inventory --site pascal --refresh-sizes
 python -m mtscripts fetch 8f3a19c7d205e64b91ac ./download --site pascal
@@ -256,8 +299,10 @@ explicit. An existing download must have the exact same run manifest.
 Progress reads at most a header and 64 KiB from the CSV tail, ignoring the last
 row while it is being written. Current MTS2D uses an increasing path coordinate,
 so progress is `(load - startLoad) / totalLoad`, including cyclic/directional
-protocols. A successful early-stop protocol may finish below 100%; the worker's
-outcome remains separate from that loading-budget fraction.
+protocols. The status Completion column reports 100% for successfully finished
+runs, including runs that reach a configured step target before the load budget.
+For other states it shows the loading-budget fraction. The raw fraction remains
+available in inventory, and the final load and stopping reason remain visible.
 
 Ordinary status refreshes use cached sizes and never run recursive `du`.
 `--refresh-sizes` estimates file bytes using counts and up to five file-size
@@ -327,3 +372,45 @@ load 0.15 with initial noise 0.05, `epsR=1e-6`, and increment `1e-5`.
 They stop at 20 plastic steps or 20 completed loading steps (`stopWhen=any`),
 excluding initialization; the strain budget is 0.001 as an additional cap.
 Routine VTUs, dumps and detailed minimizer logging are disabled.
+
+`examples/magi-chain-smoke.conf` records the two-allocation, checkpointed L50
+smoke test. The first allocation reached 20 plastic steps after 2690 loading
+steps at load 0.17690; the continuation loaded its final dump and left the macro
+CSV unchanged. `examples/magi-benchmark-base.conf` uses the subsequently agreed
+`totalLoad=0.85` (start 0.15, load cap 1.0), a 20-plastic-step target with no
+total-step target, and disabled dumps/checkpoints for the timed benchmark.
+
+## MAGI benchmark release: benchmark-magi-20261023
+
+`campaigns/magi-benchmark-20261023.json` saves all 2000 timed configurations
+(L=50/100/200/400/800, 1/2/4/8/16 workers, none/exactTangent, none/edgeFlip,
+seeds 0–19), plus one separate L800, seed-0, 16-worker tangent/edgeFlip
+minimization-logging diagnostic. Every run starts at 0.15, uses increment 1e-5
+and epsR=1e-6, stops at 20 plastic steps, and has a load cap of 1.0. Dumps,
+checkpoints and routine mesh output are disabled. The diagnostic is excluded
+from benchmark timing comparisons.
+
+The adjacent `.resources.json` pins the simulator revision and campaign checksum.
+L50/100 request 4 GiB, L200 8 GiB, L400 16 GiB, and L800 56 GiB. Each smaller
+run requests three days; L800 requests unlimited time (`time=0`). All use COMPUTE
+with core places and close binding. The diagnostic is submitted first.
+
+Validate the matrix locally without submitting anything:
+
+```sh
+python -m campaigns.launch_magi_benchmark campaigns/magi-benchmark-20261023.json --dry-run
+```
+
+After deployment and build, run the controller on MAGI from the deployed package
+directory, with the Slurm module loaded:
+
+```sh
+python3 -u -m campaigns.launch_magi_benchmark campaigns/magi-benchmark-20261023.json --site local
+```
+
+Per-job receipts and controller status are saved under
+`.state/MAGI-Benchmark-20261023/`. If submission is interrupted, inspect them and
+use `--resume`: confirmed scheduler IDs are reused, and an uncertain submission
+raises an error instead of submitting a possible duplicate. Keep the deployed
+package fixed for the entire campaign. `magi-pilot` retains access to the earlier
+pilot deployment; `magi` now selects the isolated benchmark deployment.

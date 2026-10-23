@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from mtscripts.cluster import Site, call, deploy, fetch, load_sites, paths, serve, submit, sync_journals
 from mtscripts.config import Config, DEFAULTS, sweep
+from mtscripts.data import read_macros
 from mtscripts.files import digest, file_digest, read_json, write_json
 from mtscripts.inventory import estimate_size, inventory, progress, rebuild_index
 from mtscripts.journal import Journal
@@ -262,6 +263,70 @@ print("finished",flush=True)
                 launch(attempt, mode="slurm")
         self.assertEqual(read_json(attempt / "status.json")["state"], "failed")
 
+    def test_slurm_chain_dependency_and_late_checkpoint_selection(self):
+        site = Site(name="fixture", directory=str(self.root), executable=str(self.exe),
+                    output_root=str(self.output), state_dir=str(self.state), mode="slurm")
+        def sbatch(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, str(123 + submitter.call_count), "")
+        with patch("mtscripts.runner.subprocess.run", side_effect=sbatch) as submitter:
+            result = serve({"site": asdict(site), "operation": "run", "options": {
+                "settings": Config().as_dict(), "chain": 2}})
+            self.assertEqual(submitter.call_count, 2)
+            self.assertIn("--dependency=afterany:124", submitter.call_args.args[0])
+        first, second = [Path(j["attempt"]) for j in result["jobs"]]
+        self.assertIsNone(read_json(second / "request.json")["input"])
+        with self.assertRaises(RuntimeError):
+            self.prepare()
+        with redirect_stdout(io.StringIO()):
+            execute(first)
+        folder = first.parent.parent
+        newer = folder / "dumps/newest.xml.gz"
+        newer.write_text("created after continuation was submitted")
+        old = folder / "dumps/state.xml.gz"
+        os.utime(old, ns=(1, 1))
+        # A genuinely running attempt must remain visible ahead of queued continuations.
+        status = read_json(first / "status.json")
+        write_json(first / "status.json", status | {"state": "running"})
+        self.assertEqual(inventory(self.output)[0]["attempt"], str(first))
+        self.assertEqual(inventory(self.output)[0]["queued_continuations"], 1)
+        original = subprocess.run
+        def accounting(args, **kwargs):
+            if args[0] == "sacct":
+                return subprocess.CompletedProcess(args, 0, "124|TIMEOUT|\n", "")
+            return original(args, **kwargs)
+        with patch("mtscripts.runner.subprocess.run", side_effect=accounting), redirect_stdout(io.StringIO()):
+            execute(second)
+        resumed = read_json(second / "request.json")
+        self.assertEqual(resumed["input"], {"checkpoint": str(newer), "sha256": file_digest(newer)})
+        self.assertEqual(read_json(second / "status.json")["command"][-2:], ["-d", str(newer)])
+        self.assertEqual(read_json(first / "status.json")["scheduler_terminal_state"], "TIMEOUT")
+        self.assertIn("checkpoint_selected", [r["event"] for r in Journal(self.state).records()])
+
+    def test_latest_checkpoint_missing_and_chain_cancellation_fail_explicitly(self):
+        first = self.prepare()
+        write_json(first / "status.json", {"state": "queued", "scheduler_id": "123"})
+        second = self.prepare(checkpoint="latest", after=first)
+        with patch("mtscripts.runner.subprocess.run", return_value=
+                   subprocess.CompletedProcess([], 0, "123|CANCELLED|\n", "")):
+            with self.assertRaisesRegex(RuntimeError, "CANCELLED"):
+                execute(second)
+        self.assertEqual(read_json(second / "status.json")["state"], "failed")
+        # Explicit latest resume also fails instead of silently starting from scratch.
+        write_json(first / "status.json", {"state": "finished", "scheduler_id": "123"})
+        latest = self.prepare(checkpoint="latest")
+        with self.assertRaisesRegex(FileNotFoundError, "No checkpoint"):
+            execute(latest)
+        self.assertEqual(read_json(latest / "status.json")["state"], "failed")
+
+    def test_chain_validation_before_submission(self):
+        site = Site(name="fixture", directory=str(self.root), executable=str(self.exe),
+                    output_root=str(self.output), state_dir=str(self.state), mode="slurm")
+        for chain, settings in ((0, {}), (True, {}), (2, {"writeDumps": False})):
+            with self.assertRaises(ValueError):
+                serve({"site": asdict(site), "operation": "run", "options": {
+                    "settings": Config(**settings).as_dict(), "chain": chain}})
+        self.assertFalse(self.output.exists())
+
     def test_json_remote_endpoint_and_journal_merge(self):
         site = Site(name="fixture", directory=str(self.root), executable=str(self.exe),
                     output_root=str(self.output), state_dir=str(self.state))
@@ -336,7 +401,56 @@ print("finished",flush=True)
         self.assertEqual(status["scheduler_terminal_state"], "TIMEOUT")
 
 
+    def test_benchmark_controller_resumes_confirmed_jobs_and_refuses_uncertainty(self):
+        from campaigns.launch_magi_benchmark import main as submit_campaign
+        from mtscripts.files import file_digest
+        build = read_json(self.exe.parent/"build-manifest.json")
+        write_json(self.exe.parent/"build-manifest.json", build | {"build_options": {"ENABLE_NATIVE_ARCH": "OFF"}})
+        site = Site(name="local", directory=str(self.root), executable=str(self.exe),
+                    output_root=str(self.output), state_dir=str(self.state), mode="slurm")
+        sites = self.root/"sites.toml"
+        settings = asdict(site); settings.pop("name")
+        sites.write_text("[sites.local]\n" + "\n".join(f"{k} = {json.dumps(v)}" for k,v in settings.items()))
+        campaign = self.root/"campaign.json"
+        entries = [{"label": "Bench", "settings": Config().as_dict()},
+                   {"label": "Diagnostic", "settings": Config(logDuringMinimization=True).as_dict()}]
+        write_json(campaign, {"name": "ControllerTest", "runs": entries})
+        write_json(campaign.with_suffix(".resources.json"), {"campaign_sha256": file_digest(campaign),
+            "diagnostic_label": "Diagnostic", "benchmark_jobs": 1, "site": "fixture",
+            "simulator_revision": "test", "resources": {"3": {"time": "01:00:00", "mem": "4G"}}})
+        args = [str(campaign), "--sites", str(sites)]
+        def sbatch(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, str(700 + scheduler.call_count), "")
+        with patch("mtscripts.runner.subprocess.run", side_effect=sbatch) as scheduler, redirect_stdout(io.StringIO()):
+            submit_campaign(args)
+            self.assertEqual(scheduler.call_count, 2)
+            submit_campaign(args + ["--resume"])
+            self.assertEqual(scheduler.call_count, 2)
+            with self.assertRaises(FileExistsError):
+                submit_campaign(args)
+        folder = self.state/"ControllerTest"
+        self.assertEqual(read_json(folder/"submission.json")["accepted"], 2)
+        receipts = [json.loads(line) for line in (folder/"submissions.jsonl").read_text().splitlines()]
+        self.assertEqual(len(receipts), 2)
+        attempt = Path(receipts[-1]["attempt"])
+        write_json(attempt/"status.json", {"state": "queued"})
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "Uncertain submission"):
+            submit_campaign(args + ["--resume"])
+
+
 class DataTests(unittest.TestCase):
+    def test_macro_readers_accept_extra_named_columns_without_changing_schema(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/"macroData.csv"
+            path.write_text("future_metric,tangent_preparation_time_s,load\n17,0.25,0.1\n18,0.25,0.2\n")
+            rows = read_macros(path)
+            self.assertEqual(rows[-1]["future_metric"], "18")
+            self.assertEqual(rows[-1]["tangent_preparation_time_s"], "0.25")
+            self.assertAlmostEqual(progress(folder, Config(totalLoad=1))["fraction"], .2)
+            path.write_text(path.read_text() + "#HEADER:load,different_metric\n")
+            with self.assertRaises(ValueError):
+                read_macros(path)
+
     def test_bounded_size_nested_files_and_symlinks(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

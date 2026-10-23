@@ -63,10 +63,12 @@ def parser():
         c.add_argument("path", type=Path)
         c.add_argument("--site", default="local")
         c.add_argument("--mode", choices=["foreground", "detached", "slurm"])
+        c.add_argument("--chain", type=int, default=1,
+                       help="Total sequential Slurm jobs per run; later jobs resume the latest dump")
         if name == "run":
             c.add_argument("--campaign", default="AdHoc")
             c.add_argument("--label")
-            c.add_argument("--checkpoint", help="Explicit checkpoint path on the execution host")
+            c.add_argument("--checkpoint", help="Checkpoint path on the execution host, or 'latest'")
         else:
             c.add_argument("--workers", type=int, default=2)
     for name in ("stop", "logs"):
@@ -180,6 +182,8 @@ def main(argv=None):
     if args.command in {"run", "campaign"}:
         if args.mode:
             site = replace(site, mode=args.mode)
+        if args.chain < 1 or (args.chain > 1 and site.mode != "slurm"):
+            raise ValueError("--chain requires a positive count and Slurm for multiple jobs")
         campaign, entries = ((args.campaign, [(Config.read(args.path), args.label)])
                              if args.command == "run" else campaign_entries(args.path))
         if not site.ssh and site.mode == "foreground":
@@ -203,7 +207,8 @@ def main(argv=None):
                 result = {"attempts": list(map(str, attempts))}
         else:
             result = [submit(site, config, state_dir=state_dir, campaign=campaign, label=label,
-                             checkpoint=args.checkpoint if args.command == "run" else None)
+                             checkpoint=args.checkpoint if args.command == "run" else None,
+                             chain=args.chain)
                       for config, label in entries]
     elif args.command == "deploy":
         result = deploy(site, include_source=args.source is not None, local_source=args.source)

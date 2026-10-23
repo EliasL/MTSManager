@@ -27,18 +27,18 @@ mem = "4G"
 # MAGI COMPUTE: two hardware threads per physical core; compact OpenMP binding.
 [sites.magi]
 ssh = "magi"
-directory = "~/simulation/MTSManager-pilot-20261022"
-source = "../MTS2D-current-bc375c7"
+directory = "~/simulation/MTSManager-benchmark-magi-20261023"
+source = "../MTS2D-benchmark-magi-20261023"
 python = "python3"
 executable = "build/MTS2D"
-output_root = "~/MTS2D_current_output/pilot-20261022-bc375c7"
+output_root = "~/MTS2D_current_output/benchmark-magi-20261023"
 state_dir = ".state"
 mode = "slurm"
 native_arch = false
 slurm_cpus_per_thread = 2
 setup = "source /etc/profile.d/modules.sh\nmodule load /softs/trixie/modules/x86-64/slurm/default"
 [sites.magi.slurm]
-time = "01:00:00"
+time = "3-00:00:00"
 partition = "COMPUTE"
 mem = "4G"
 [sites.magi.environment]
@@ -70,3 +70,27 @@ mode = "slurm"
 time = "01:00:00"
 account = "bph@cpu"
 mem = "4G"
+
+# Retained pilot deployment and completed smoke tests.
+[sites.magi-pilot]
+ssh = "magi"
+directory = "~/simulation/MTSManager-pilot-20261022"
+source = "../MTS2D-current-bc375c7"
+python = "python3"
+executable = "build/MTS2D"
+output_root = "~/MTS2D_current_output/pilot-20261022-bc375c7"
+state_dir = ".state"
+mode = "slurm"
+native_arch = false
+slurm_cpus_per_thread = 2
+setup = "source /etc/profile.d/modules.sh\nmodule load /softs/trixie/modules/x86-64/slurm/default"
+[sites.magi-pilot.slurm]
+time = "01:00:00"
+partition = "COMPUTE"
+mem = "4G"
+[sites.magi-pilot.environment]
+OMP_PLACES = "cores"
+OMP_PROC_BIND = "close"
+OMP_DYNAMIC = "FALSE"
+OMP_DISPLAY_ENV = "VERBOSE"
+OMP_DISPLAY_AFFINITY = "TRUE"

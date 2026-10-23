@@ -46,12 +46,16 @@ def cpu_allocation():
 
 
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
-            checkpoint=None, site="local", environment=None):
+            checkpoint=None, site="local", environment=None, after=None):
     executable = Path(executable).resolve()
     build = executable_identity(executable)
     output_root = Path(output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    checkpoint = Path(checkpoint).resolve() if checkpoint else None
+    resume_latest = checkpoint == "latest"
+    checkpoint = Path(checkpoint).resolve() if checkpoint and not resume_latest else None
+    after = Path(after).resolve() if after else None
+    if resume_latest and not config["writeDumps"] and not config["checkpointInterval"]:
+        raise ValueError("Latest-checkpoint resume requires dumps or periodic checkpoints")
     if checkpoint and not checkpoint.is_file():
         raise FileNotFoundError(checkpoint)
     with locked(output_root / ".prepare.lock"):
@@ -64,6 +68,13 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         if matches:
             folder = output_root / matches[0]
         manifest_path = folder / "manifest.json"
+        if after:
+            if not resume_latest or after.parent != folder / "attempts":
+                raise ValueError("A continuation must resume the same run's latest checkpoint")
+            attempts = sorted((folder / "attempts").iterdir(),
+                              key=lambda a: read_json(a / "request.json")["created_at"])
+            if after != attempts[-1] or not read_json(after / "status.json").get("scheduler_id"):
+                raise ValueError("Chain predecessor must be the latest submitted Slurm attempt")
         identity = {"config_hash": config.config_hash, "settings": config.as_dict(),
                     "executable_sha256": build["executable_sha256"]}
         if manifest_path.exists():
@@ -72,9 +83,9 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                 raise ValueError("Output belongs to different settings/executable; use another output root")
             previous_statuses = [read_json(a / "status.json") for a in (folder / "attempts").iterdir()]
             for status in previous_statuses:
-                if status["state"] in ACTIVE:
+                if status["state"] in ACTIVE and not after:
                     raise RuntimeError(f"An active attempt already exists in {folder / 'attempts'}")
-            if checkpoint is None and (any("started_at" in s for s in previous_statuses) or
+            if checkpoint is None and not resume_latest and (any("started_at" in s for s in previous_statuses) or
                                        (folder / "macroData.csv").exists()):
                 raise FileExistsError(f"Run already exists; explicitly resume a checkpoint: {folder}")
             if Config.read(folder / "config.conf", expected_name=folder.name).config_hash != config.config_hash:
@@ -82,7 +93,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         else:
             if folder.exists():
                 raise FileExistsError(f"Unmanaged output directory: {folder}")
-            if checkpoint is not None:
+            if checkpoint is not None or resume_latest:
                 raise ValueError("Resume requires the original managed output folder and configuration")
             folder.mkdir()
             (folder / "config.conf").write_text(config.text(folder.name))
@@ -101,6 +112,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                    "site": site, "host": socket.gethostname(), "output_folder": str(folder),
                    "state_dir": str(Path(state_dir).resolve()), "executable": str(executable),
                    "build": build, "scripts": scripts_identity(), "input": inputs,
+                   "resume_latest": resume_latest, "predecessor": str(after) if after else None,
                    "environment": dict(environment or {}),
                    "created_at": now()}
         write_json(attempt / "request.json", request)
@@ -159,12 +171,16 @@ def launch(attempt, *, mode="foreground", slurm=None, setup=""):
             raise ValueError("Slurm CPU allocation is smaller than nrThreads")
         args = ["sbatch", "--parsable", f"--job-name={Path(request['output_folder']).name}",
                 f"--output={attempt / 'launcher.log'}", "--nodes=1", "--ntasks=1"]
+        if request.get("predecessor"):
+            predecessor = read_json(Path(request["predecessor"]) / "status.json")["scheduler_id"]
+            args += [f"--dependency=afterany:{predecessor}"]
         args += [f"--{k}={v}" for k, v in ({"cpus-per-task": threads} | slurm).items()]
         script = attempt / "submit.sh"
         script.write_text("#!/bin/bash\nset -euo pipefail\n" + setup + "\ncd " +
                           shlex.quote(str(PACKAGE_ROOT)) + "\nexec " + shlex.join(cmd) + "\n")
         # Mark pending before sbatch: a fast scheduler may start the worker immediately.
-        set_status(attempt, "queued", slurm={"cpus-per-task": threads} | slurm)
+        set_status(attempt, "queued", slurm={"cpus-per-task": threads} | slurm,
+                   predecessor=request.get("predecessor"))
         result = subprocess.run(args + [str(script)], capture_output=True, text=True, check=True)
         job_id = result.stdout.strip().split(";", 1)[0]
         if not job_id.isdigit():
@@ -200,6 +216,32 @@ def execute(attempt):
                 raise ValueError("Executable/build manifest changed after submission")
             if scripts_identity() != request["scripts"]:
                 raise ValueError("Scripts changed after submission")
+            if request.get("predecessor"):
+                previous = Path(request["predecessor"])
+                job = read_json(previous / "status.json")["scheduler_id"]
+                accounting = subprocess.run(["sacct", "-X", "-n", "-P", "-j", job,
+                    "--format=JobIDRaw,State"], capture_output=True, text=True, check=True)
+                rows = [line.split("|") for line in accounting.stdout.splitlines()]
+                state = next((r[1].split()[0] for r in rows if r[0] == job), None)
+                if state not in {"COMPLETED", "TIMEOUT", "PREEMPTED", "NODE_FAIL"}:
+                    raise RuntimeError(f"Cannot continue after Slurm job {job}: {state}")
+                if read_json(previous / "status.json")["state"] in ACTIVE:
+                    set_status(previous, "stopped", scheduler_terminal_state=state,
+                               reason="Previous allocation ended before its worker recorded an outcome")
+            if request.get("resume_latest"):
+                dumps = list((folder / "dumps").glob("*.xml.gz"))
+                if not dumps:
+                    raise FileNotFoundError(f"No checkpoint available to resume in {folder / 'dumps'}")
+                checkpoint = max(dumps, key=lambda p: p.stat().st_mtime_ns).resolve()
+                if not checkpoint.is_relative_to(folder):
+                    raise ValueError("Latest checkpoint must belong to this run")
+                request["input"] = {"checkpoint": str(checkpoint), "sha256": file_digest(checkpoint)}
+                request["run_identity"] = digest({"config": config.config_hash,
+                    "executable": request["build"]["executable_sha256"],
+                    "input": request["input"]["sha256"]})
+                write_json(attempt / "request.json", request)
+                Journal(request["state_dir"]).append("checkpoint_selected", **event_fields(request),
+                                                    input=request["input"])
             cmd = [request["executable"], "-c", str(folder / "config.conf"), "-o", str(folder.parent)]
             if request["input"]:
                 item = request["input"]

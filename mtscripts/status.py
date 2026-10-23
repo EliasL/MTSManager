@@ -83,17 +83,19 @@ def render_view(responses, view):
                     rows.append((site, label, size, estimate["estimated_at"] if estimate else "—"))
                 else:
                     state = item["status"]["state"]
+                    if item.get("queued_continuations"):
+                        state += f" / {item['queued_continuations']} queued behind"
                     if item.get("termination"):
                         state += " / " + item["termination"]["stopReason"]
                     if item["status"].get("process_alive") is False:
                         state += " (process missing)"
                     if item["status"].get("scheduler_state"):
                         state += " / " + item["status"]["scheduler_state"]
-                    fraction = item["progress"]["fraction"]
+                    fraction = 1.0 if item["status"]["state"] == "finished" else item["progress"]["fraction"]
                     rows.append((site, label, state, f"{100*fraction:.1f}%" if fraction is not None else "—",
                                  item["status"].get("scheduler_id", "—"), item["progress"].get("load")))
     headers = {"servers": ["Site", "CPUs", "Load(1m)", "RAM available", "Disk free", "Your Slurm jobs"],
-               "jobs": ["Site", "Run", "State", "Progress", "Slurm ID", "Load"],
+               "jobs": ["Site", "Run", "State", "Completion", "Slurm ID", "Load"],
                "data": ["Site", "Run", "Estimated size", "Estimate timestamp"]}[view]
     output = table(headers, rows)
     if errors:

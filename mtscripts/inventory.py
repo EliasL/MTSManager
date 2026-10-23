@@ -125,7 +125,10 @@ def inventory(output_root, *, config_hash=None, refresh_sizes=False):
             raise ValueError(f"Index/config mismatch: {folder}")
         attempts = sorted((folder / "attempts").iterdir(),
                           key=lambda p: read_json(p / "request.json")["created_at"])
-        attempt = attempts[-1] if attempts else None
+        statuses = {a: read_json(a / "status.json") for a in attempts}
+        active = [a for a in attempts if statuses[a]["state"] in {"running", "stopping"}]
+        queued = [a for a in attempts if statuses[a]["state"] in {"prepared", "queued"}]
+        attempt = (active[-1] if active else queued[0] if queued else attempts[-1]) if attempts else None
         request = read_json(attempt / "request.json") if attempt else {}
         status = read_json(attempt / "status.json") if attempt else {"state": "unknown"}
         if status["state"] == "running" and "scheduler_id" not in status:
@@ -137,6 +140,8 @@ def inventory(output_root, *, config_hash=None, refresh_sizes=False):
         result.append({"config_hash": h, "folder": str(folder), "attempt": str(attempt) if attempt else None,
                        "manifest_sha256": file_digest(folder / "manifest.json"),
                        "campaign": request.get("campaign"), "status": status,
+                       "queued_continuations": len([a for a in queued if a != attempt]),
+                       "attempts": [{"attempt": str(a), "status": statuses[a]} for a in attempts],
                        "termination": read_json(folder / "termination.json")["termination"]
                            if status["state"] == "finished" and (folder / "termination.json").exists() else None,
                        "progress": progress(folder, config),

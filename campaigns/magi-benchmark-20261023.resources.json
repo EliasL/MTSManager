@@ -1,0 +1,30 @@
+{
+  "benchmark_jobs": 2000,
+  "campaign_sha256": "fdf13efbe120209acfa944bf829bc2bc9cf365de632420fd6752adfbb3ef2968",
+  "diagnostic_label": "DiagnosticL800t16CexactTangentRedgeFlips0",
+  "resources": {
+    "100": {
+      "mem": "4G",
+      "time": "3-00:00:00"
+    },
+    "200": {
+      "mem": "8G",
+      "time": "3-00:00:00"
+    },
+    "400": {
+      "mem": "16G",
+      "time": "3-00:00:00"
+    },
+    "50": {
+      "mem": "4G",
+      "time": "3-00:00:00"
+    },
+    "800": {
+      "mem": "56G",
+      "time": "0"
+    }
+  },
+  "simulator_revision": "ed22edb67868384209696a506696e99eab26f56b",
+  "site": "magi",
+  "tag": "benchmark-magi-20261023"
+}

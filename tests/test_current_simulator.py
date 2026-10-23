@@ -24,6 +24,27 @@ SOURCE = PACKAGE_ROOT.parent / "MTS2D"
 @unittest.skipUnless(EXE.exists() and (EXE.parent/"build-manifest.json").exists(),
                      "Build the current MTS2D executable to run integration smoke tests")
 class CurrentSimulatorTests(unittest.TestCase):
+    def test_latest_final_dump_does_not_repeat_completed_loading(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = Config(rows=4, cols=4, boundary="periodic", initialGuessNoise=0,
+                            totalLoad=.004, loadIncrement=.001, stopAfterSteps=2,
+                            checkpointInterval=1, loading="noRelaxation", writeMeshVTUs=False)
+            options = dict(executable=EXE, output_root=root/"output", state_dir=root/"state")
+            first = prepare(config, **options)
+            with redirect_stdout(io.StringIO()):
+                execute(first)
+            folder = first.parent.parent
+            before = (folder/"macroData.csv").read_bytes()
+            latest = prepare(config, checkpoint="latest", **options)
+            with redirect_stdout(io.StringIO()):
+                execute(latest)
+            self.assertEqual((folder/"macroData.csv").read_bytes(), before)
+            self.assertEqual(read_json(folder/"termination.json")["termination"]["steps"], 2)
+            selected = read_json(latest/"request.json")["input"]["checkpoint"]
+            self.assertNotIn("checkpoint_", Path(selected).name)  # Final dump, not the older rotating slots.
+            self.assertEqual(read_json(latest/"status.json")["returncode"], 0)
+
     def test_real_step_target_summary_and_checkpoint_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

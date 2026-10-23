@@ -128,13 +128,23 @@ def serve(payload):
         if settings.keys() != DEFAULTS.keys():
             raise ValueError("Remote run requests require complete settings")
         config = Config(**settings)
-        attempt = prepare(config, executable=p["executable"], output_root=p["output_root"],
-                          state_dir=p["state_dir"], site=site.name,
-                          environment=site.environment, **options)
+        chain = options.pop("chain", 1)
         # Remote sessions must survive loss of the SSH connection.
         mode = "detached" if site.mode == "foreground" else site.mode
+        if type(chain) is not int or chain < 1:
+            raise ValueError("chain must be a positive integer (total Slurm allocations)")
+        if chain > 1 and (mode != "slurm" or not config["writeDumps"]):
+            raise ValueError("Job chains require Slurm and writeDumps=true")
         slurm = {"cpus-per-task": config["nrThreads"] * site.slurm_cpus_per_thread} | site.slurm
-        return launch(attempt, mode=mode, slurm=slurm, setup=site.setup)
+        jobs = []
+        for i in range(chain):
+            if i:
+                options.update(checkpoint="latest", after=jobs[-1]["attempt"])
+            attempt = prepare(config, executable=p["executable"], output_root=p["output_root"],
+                              state_dir=p["state_dir"], site=site.name,
+                              environment=site.environment, **options)
+            jobs.append(launch(attempt, mode=mode, slurm=slurm, setup=site.setup))
+        return jobs[0] if chain == 1 else {"jobs": jobs}
     if op in {"stop", "logs"}:
         attempt = Path(options["attempt"]).expanduser().resolve()
         if not attempt.is_relative_to(Path(p["output_root"])):
@@ -208,14 +218,14 @@ def synchronized_snapshot(sites, state_dir, *, operation="snapshot", **options):
     return result
 
 
-def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=None):
+def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=None, chain=1):
     journal = Journal(state_dir)
     submission = journal.append("submission_requested", site=site.name,
                                 config_hash=config.config_hash, campaign=campaign,
-                                label=label, requested_output_root=site.output_root)
+                                label=label, requested_output_root=site.output_root, chain=chain)
     try:
         result = call(site, "run", settings=config.as_dict(), campaign=campaign,
-                      label=label, checkpoint=checkpoint)
+                      label=label, checkpoint=checkpoint, chain=chain)
     except Exception as error:
         journal.append("submission_error", submission_id=submission["event_id"],
                        site=site.name, config_hash=config.config_hash, campaign=campaign,
