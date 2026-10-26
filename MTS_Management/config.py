@@ -97,6 +97,7 @@ class Config:
 
     @property
     def config_hash(self):
+        # This saved identity format is independent of the Python package's name.
         return digest({"format": "mtscripts-config-v1", "settings": self.as_dict()})
 
     def folder_name(self, label=None):

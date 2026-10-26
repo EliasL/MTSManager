@@ -29,7 +29,7 @@ def process_token(pid):
 
 
 def python_command(*args):
-    return [sys.executable, "-u", "-m", "mtscripts", *map(str, args)]
+    return [sys.executable, "-u", "-m", "MTS_Management", *map(str, args)]
 
 
 def cpu_allocation():

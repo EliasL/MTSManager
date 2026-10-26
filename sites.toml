@@ -13,6 +13,7 @@ native_arch = true
 # Verified SSH alias, Python 3.12 and Slurm. Deploy this package before use.
 [sites.pascal]
 ssh = "pascal"
+management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
 directory = "~/simulation/NewSimulationScripts"
 source = "../MTS2D-current-11100d1"
 python = "python3"
@@ -27,6 +28,7 @@ mem = "4G"
 # MAGI COMPUTE: two hardware threads per physical core; compact OpenMP binding.
 [sites.magi]
 ssh = "magi"
+management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
 directory = "~/simulation/MTSManager-benchmark-magi-20261023"
 source = "../MTS2D-benchmark-magi-20261023"
 python = "python3"
@@ -51,6 +53,7 @@ OMP_DISPLAY_AFFINITY = "TRUE"
 # Verify paths and cluster setup before use.
 [sites.schwartz]
 ssh = "schwartz"
+management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
 directory = "~/simulation/NewSimulationScripts"
 source = "../MTS2D-current-11100d1"
 python = "python3"
@@ -60,6 +63,7 @@ mode = "detached"
 # Verify paths and cluster setup before use.
 [sites.jeanZay]
 ssh = "jeanZay"
+management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
 directory = "~/simulation/NewSimulationScripts"
 source = "../MTS2D-current-11100d1"
 python = "python3" # configure the Python/compiler module environment below if needed
@@ -74,6 +78,7 @@ mem = "4G"
 # Retained pilot deployment and completed smoke tests.
 [sites.magi-pilot]
 ssh = "magi"
+management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
 directory = "~/simulation/MTSManager-pilot-20261022"
 source = "../MTS2D-current-bc375c7"
 python = "python3"

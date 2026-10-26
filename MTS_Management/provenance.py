@@ -45,7 +45,8 @@ def source_identity(source):
         branch = command(["git", "-C", str(source), "branch", "--show-current"])
         if branch != "main":
             raise ValueError(f"New simulations require MTS2D main; found {branch!r}")
-        if command(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"]):
+        if command(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no",
+                    "--", "CMakeLists.txt", "src", "libs"]):
             raise ValueError("Commit tracked MTS2D changes before preparing a build")
         tracked = set(source_files(source))
         actual = {str(p.relative_to(source)) for p in (source / "src").rglob("*") if p.is_file()}
@@ -77,6 +78,13 @@ def build(source, build_dir, *, jobs=2, native_arch=False):
         raise ValueError("Build jobs must be positive")
     if type(native_arch) is not bool:
         raise TypeError("native_arch must be a boolean")
+    cache_path = build_dir / "CMakeCache.txt"
+    if cache_path.exists():
+        paths = dict(re.findall(r"^(CMAKE_HOME_DIRECTORY|CMAKE_CACHEFILE_DIR):INTERNAL=(.*)$",
+                                cache_path.read_text(), re.MULTILINE))
+        if any(Path(paths[key]) != expected for key, expected in
+               (("CMAKE_HOME_DIRECTORY", source), ("CMAKE_CACHEFILE_DIR", build_dir)) if key in paths):
+            raise ValueError("CMake build was moved; preserve the old build directory and build in a fresh directory")
     identity = source_identity(source)
     verify_schema(source)
     subprocess.run(["cmake", "-S", str(source), "-B", str(build_dir),

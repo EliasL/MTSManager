@@ -6,11 +6,11 @@ import json
 import os
 from pathlib import Path
 
-from mtscripts.cli import campaign_entries
-from mtscripts.cluster import load_sites, paths, serve
-from mtscripts.files import canonical, file_digest, locked, read_json, write_json
-from mtscripts.journal import Journal
-from mtscripts.provenance import executable_identity
+from MTS_Management.campaign import campaign_entries
+from MTS_Management.cluster import load_sites, paths, serve
+from MTS_Management.files import canonical, file_digest, locked, read_json, write_json
+from MTS_Management.journal import Journal
+from MTS_Management.provenance import executable_identity
 
 
 def main(argv=None):

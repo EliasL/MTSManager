@@ -14,7 +14,7 @@ import tempfile
 import tomllib
 
 from .config import Config, DEFAULTS
-from .files import canonical, digest, file_digest, locked, read_json, write_json
+from .files import canonical, digest, file_digest, locked, now, read_json, write_json
 from .inventory import inventory, rebuild_index, resources
 from .journal import Journal
 from .provenance import build, source_files, source_identity
@@ -27,6 +27,7 @@ class Site:
     ssh: str = ""
     directory: str = "."
     python: str = "python3"
+    management_module: str = "MTS_Management"
     source: str = "../MTS2D"
     executable: str = "build/MTS2D"
     output_root: str = "output"
@@ -39,6 +40,8 @@ class Site:
     slurm: dict = field(default_factory=dict)
 
     def __post_init__(self):
+        if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", self.management_module):
+            raise ValueError("management_module must be a Python module name")
         if self.ssh and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@-]*", self.ssh):
             raise ValueError("ssh must be an SSH config alias or user@hostname")
         if self.mode not in {"foreground", "detached", "slurm"}:
@@ -164,16 +167,18 @@ def serve(payload):
 
 
 def call(site, operation, *, timeout=30, **options):
-    payload = {"site": asdict(site), "operation": operation, "options": options}
+    settings = asdict(site)
+    module = settings.pop("management_module")  # Client transport setting, not remote job data.
+    payload = {"site": settings, "operation": operation, "options": options}
     if not site.ssh and not site.setup:
         return serve(payload)
-    cmd = f"cd {shell_path(site.directory)} && {shlex.join([site.python, '-u', '-m', 'mtscripts', '_serve'])}"
+    cmd = f"cd {shell_path(site.directory)} && {shlex.join([site.python, '-u', '-m', module, '_serve'])}"
     if site.setup:
         cmd = site.setup + "\n" + cmd
     args = (["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
              site.ssh, "bash -lc " + shlex.quote("set -e\n" + cmd)] if site.ssh else
             ["bash", "-lc", "set -e\n" + site.setup + "\ncd " + shell_path(site.directory) +
-             "\n" + shlex.join([sys.executable, "-u", "-m", "mtscripts", "_serve"])])
+             "\n" + shlex.join([sys.executable, "-u", "-m", module, "_serve"])])
     result = subprocess.run(args,
                             input=canonical(payload).decode(), capture_output=True, text=True,
                             timeout=timeout, check=True)
@@ -241,6 +246,8 @@ def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=
 def deploy(site, *, include_source=False, local_source=None):
     if not site.ssh:
         raise ValueError("deploy requires a remote site")
+    if site.management_module != "MTS_Management":
+        raise ValueError("For a new deployment, select MTS_Management and a new remote directory first")
     directory = site.directory
     if not directory.startswith("/"):
         if not directory.startswith("~/"):
@@ -311,21 +318,72 @@ def deploy(site, *, include_source=False, local_source=None):
 
 
 def fetch(site, config_hash, destination, *, kind="macro"):
-    matches = call(site, "inventory", config_hash=config_hash)
-    if len(matches) != 1:
-        raise ValueError(f"Expected one run; found {len(matches)}")
-    folder = Path(matches[0]["folder"])
-    source = str(folder) + "/"
-    destination = Path(destination).resolve() / folder.name
-    if not site.ssh and destination.is_relative_to(folder):
-        raise ValueError("Fetch destination must be outside the source run")
-    if destination.exists() and any(destination.iterdir()):
-        manifest = destination / "manifest.json"
-        if not manifest.exists() or file_digest(manifest) != matches[0]["manifest_sha256"]:
-            raise ValueError("Download destination contains a different/unmanaged run")
+    return fetch_many(site, [config_hash], destination, kind=kind)[0]
+
+
+def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only=False):
+    """Validate one inventory, then transfer selected runs in one rsync call.
+
+    completed_only skips absent/not-yet-terminated campaign members explicitly.
+    A receipt records this retrieval; simulation identities are never rewritten.
+    """
+    if kind not in {"macro", "full"}:
+        raise ValueError("Fetch kind must be macro or full")
+    hashes = list(config_hashes)
+    if len(set(hashes)) != len(hashes) or any(
+            not re.fullmatch(r"[0-9a-f]{20,64}", h) for h in hashes):
+        raise ValueError("Provide distinct configuration hashes of 20–64 hex characters")
+    if not hashes:
+        return []
+    available = call(site, "inventory")
+    selected = {}
+    for prefix in hashes:
+        matches = [r for r in available if r["config_hash"].startswith(prefix)]
+        if len(matches) > 1 or (not matches and not completed_only):
+            raise ValueError(f"Expected one run for {prefix}; found {len(matches)}")
+        if matches and (not completed_only or matches[0].get("termination") is not None):
+            row = matches[0]
+            if row["config_hash"] in selected:
+                raise ValueError("Multiple requested hashes select the same run")
+            selected[row["config_hash"]] = row
+    rows = sorted(selected.values(), key=lambda r: r["config_hash"])
+    if not rows:
+        return []
+    roots = {Path(r["folder"]).parent for r in rows}
+    if len(roots) != 1:
+        raise ValueError("Batch fetch requires runs in one output root")
+    root = roots.pop()
+    destination = Path(destination).resolve()
+    for row in rows:
+        source = Path(row["folder"])
+        if not site.ssh and destination.is_relative_to(source):
+            raise ValueError("Fetch destination must be outside the source run")
+        target = destination / source.name
+        if not site.ssh and target == source.resolve():
+            raise ValueError("Fetch destination must differ from the source run")
+        if target.exists() and any(target.iterdir()):
+            manifest = target / "manifest.json"
+            if not manifest.exists() or file_digest(manifest) != row["manifest_sha256"]:
+                raise ValueError(f"Download destination contains a different/unmanaged run: {target}")
     destination.mkdir(parents=True, exist_ok=True)
-    origin = f"{site.ssh}:{shlex.quote(source)}" if site.ssh else source
-    filters = (["--include=macroData.csv", "--include=config.conf", "--include=manifest.json", "--include=termination.json", "--exclude=*"]
+    origin = f"{site.ssh}:{shlex.quote(str(root))}/" if site.ssh else str(root) + "/"
+    filters = (["--include=/*/", "--include=macroData.csv", "--include=config.conf",
+                "--include=manifest.json", "--include=termination.json", "--exclude=*"]
                if kind == "macro" else [])
-    subprocess.run(["rsync", "-a", "-e", "ssh -T", *filters, origin, str(destination) + "/"], check=True)
-    return str(destination)
+    with tempfile.TemporaryDirectory() as temporary:
+        listing = Path(temporary) / "runs.txt"
+        listing.write_text("".join(Path(r["folder"]).name + "/\n" for r in rows))
+        subprocess.run(["rsync", "-ar", "-e", "ssh -T", "--files-from=" + str(listing),
+                        *filters, origin, str(destination) + "/"], check=True)
+    for row in rows:
+        target = destination / Path(row["folder"]).name
+        if file_digest(target / "manifest.json") != row["manifest_sha256"]:
+            raise ValueError(f"Transferred manifest differs from inventory: {target}")
+        if Config.read(target / "config.conf", expected_name=target.name).config_hash != row["config_hash"]:
+            raise ValueError(f"Transferred configuration differs from inventory: {target}")
+        if row.get("termination") is None:
+            (target / "termination.json").unlink(missing_ok=True)
+    write_json(destination / "snapshot.json", dict(fetched_at=now(), site=site.name,
+               source_root=str(root), kind=kind, runs=[dict(config_hash=r["config_hash"],
+               manifest_sha256=r["manifest_sha256"]) for r in rows]))
+    return [str(destination / Path(r["folder"]).name) for r in rows]

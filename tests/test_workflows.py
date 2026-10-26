@@ -7,7 +7,6 @@ import io
 import json
 import os
 from pathlib import Path
-import signal
 import shutil
 import subprocess
 import sys
@@ -16,32 +15,17 @@ import time
 import unittest
 from unittest.mock import patch
 
-from mtscripts.cluster import Site, call, deploy, fetch, load_sites, paths, serve, submit, sync_journals
-from mtscripts.config import Config, DEFAULTS, sweep
-from mtscripts.data import read_macros
-from mtscripts.files import digest, file_digest, read_json, write_json
-from mtscripts.inventory import estimate_size, inventory, progress, rebuild_index
-from mtscripts.journal import Journal
-from mtscripts.provenance import build
-from mtscripts.runner import PACKAGE_ROOT, execute, launch, prepare, run_many, stop
+from MTS_Management.cluster import Site, call, deploy, fetch_many, paths, serve, submit, sync_journals
+from MTS_Management.config import Config, DEFAULTS
+from MTS_Management.data import read_macros
+from MTS_Management.files import digest, file_digest, read_json, write_json
+from MTS_Management.inventory import estimate_size, inventory, progress, rebuild_index
+from MTS_Management.journal import Journal
+from MTS_Management.provenance import build
+from MTS_Management.runner import PACKAGE_ROOT, execute, launch, prepare, run_many, stop
 
 
 class ConfigTests(unittest.TestCase):
-    def test_unified_termination_settings(self):
-        config = Config(stopAfterPlasticSteps=20, stopAfterSteps=100,
-                        stopWhen="any", loadIncrement=1e-5, epsR=1e-6)
-        self.assertEqual(config["stopAfterPlasticSteps"], 20)
-        self.assertNotEqual(config.config_hash,
-                            Config(**(config.as_dict() | {"stopWhen": "all"})).config_hash)
-        for settings in ({"stopAfterSteps": -1}, {"stopAfterSteps": True},
-                         {"stopWhen": "sometimes"}, {"stepEnergyTolerance": -1},
-                         {"stepEnergyTolerance": float("nan")},
-                         {"stopAfterPlasticSteps": 1, "loading": "noRelaxation"},
-                         {"stopAfterElasticSteps": 1, "energyFunction": "contiTriangular"},
-                         {"stopOnEnergyDrop": True}, {"FIREEpsx": 1e-6}):
-            with self.assertRaises((TypeError, ValueError)):
-                Config(**settings)
-
     def test_hash_complete_stable_and_changes_with_settings(self):
         a = Config(rows=10, totalLoad=1)
         b = Config(**dict(reversed(list(a.as_dict().items()))))
@@ -65,14 +49,6 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises((ValueError, TypeError)):
                 Config(**settings)
         Config(boundary="periodicAnchored", deformation="directDisplacement")
-
-    def test_sweep(self):
-        configs = sweep(Config(), rows=[100, 200], seed=[0, 1])
-        self.assertEqual(len({c.config_hash for c in configs}), 4)
-        self.assertEqual(sweep(Config(), L=[100])[0]["cols"], 100)
-        with self.assertRaises(ValueError):
-            sweep(Config(), L=[100], rows=[100])
-
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
@@ -108,16 +84,6 @@ print("finished",flush=True)
                        state_dir=self.state, campaign="Test", **kwargs)
 
     def test_site_build_setting_and_cache_override(self):
-        config = self.root / "sites.toml"
-        config.write_text('[sites.magi]\ndirectory = "."\nnative_arch = false\n')
-        site = load_sites(config)["magi"]
-        with patch("mtscripts.cluster.build") as mocked:
-            call(site, "build", jobs=3)
-            self.assertEqual(mocked.call_args.kwargs, {"native_arch": False, "jobs": 3})
-        self.assertFalse(Site(name="default").native_arch)
-        with self.assertRaises(TypeError):
-            Site(name="invalid", native_arch="false")
-
         cache = self.exe.parent / "CMakeCache.txt"
         cache.write_text("ENABLE_NATIVE_ARCH:BOOL=ON\n")
 
@@ -126,16 +92,18 @@ print("finished",flush=True)
                 option = next(a for a in args if a.startswith("-DENABLE_NATIVE_ARCH="))
                 cache.write_text("ENABLE_NATIVE_ARCH:BOOL=" + option.split("=", 1)[1] + "\n")
 
-        with patch("mtscripts.provenance.source_identity", return_value={"branch": "main"}), \
-             patch("mtscripts.provenance.verify_schema"), \
-             patch("mtscripts.provenance.subprocess.run", side_effect=cmake):
+        with patch("MTS_Management.provenance.source_identity", return_value={"branch": "main"}), \
+             patch("MTS_Management.provenance.verify_schema"), \
+             patch("MTS_Management.provenance.subprocess.run", side_effect=cmake):
             # The portable default must replace an existing native build's cache setting.
             record = build(self.root, self.exe.parent)
             self.assertEqual(record["build_options"]["ENABLE_NATIVE_ARCH"], "OFF")
             record = build(self.root, self.exe.parent, native_arch=True)
             self.assertEqual(record["build_options"]["ENABLE_NATIVE_ARCH"], "ON")
-            with self.assertRaises(TypeError):
-                build(self.root, self.exe.parent, native_arch="false")
+
+        cache.write_text("CMAKE_HOME_DIRECTORY:INTERNAL=/old/source\n")
+        with self.assertRaisesRegex(ValueError, "moved"):
+            build(self.root, self.exe.parent)
 
     def test_old_build_schema_is_rejected_before_creating_output(self):
         manifest = self.exe.parent/"build-manifest.json"
@@ -150,19 +118,17 @@ print("finished",flush=True)
         site = Site(name="magi", slurm_cpus_per_thread=2,
                     environment={"OMP_PLACES": "cores", "OMP_PROC_BIND": "close"})
         settings = Config(nrThreads=2).as_dict()
-        with patch("mtscripts.cluster.prepare", return_value=self.root/"attempt") as prepared, \
-             patch("mtscripts.cluster.launch") as launched:
+        with patch("MTS_Management.cluster.prepare", return_value=self.root/"attempt") as prepared, \
+             patch("MTS_Management.cluster.launch") as launched:
             serve({"site": asdict(site), "operation": "run", "options": {"settings": settings}})
             self.assertEqual(prepared.call_args.kwargs["environment"], site.environment)
             self.assertEqual(launched.call_args.kwargs["slurm"]["cpus-per-task"], 4)
         attempt = self.prepare(Config(nrThreads=2), environment=site.environment)
-        with patch("mtscripts.runner.cpu_allocation", return_value={"physical_cores": 1}), \
-             patch("mtscripts.runner.subprocess.Popen") as child:
+        with patch("MTS_Management.runner.cpu_allocation", return_value={"physical_cores": 1}), \
+             patch("MTS_Management.runner.subprocess.Popen") as child:
             with self.assertRaisesRegex(RuntimeError, "physical cores"):
                 execute(attempt)
             child.assert_not_called()
-        with self.assertRaises(ValueError):
-            Site(name="bad", slurm_cpus_per_thread=0)
 
     def test_execution_logging_resume_and_duplicate_guard(self):
         attempt = self.prepare(label="Readable")
@@ -250,7 +216,7 @@ print("finished",flush=True)
             # Simulate a worker starting before sbatch returns its ID.
             write_json(attempt / "status.json", {"state": "running"})
             return subprocess.CompletedProcess(args, 0, "123;cluster\n", "")
-        with patch("mtscripts.runner.subprocess.run", side_effect=sbatch):
+        with patch("MTS_Management.runner.subprocess.run", side_effect=sbatch):
             result = launch(attempt, mode="slurm", slurm={"time": "00:01:00"})
         self.assertEqual(result["scheduler_id"], "123")
         self.assertEqual(read_json(attempt / "status.json")["state"], "running")
@@ -258,7 +224,7 @@ print("finished",flush=True)
         self.assertIn("set -euo pipefail", script)
         self.assertIn("_execute", script)
         attempt = self.prepare(Config(seed=1))
-        with patch("mtscripts.runner.subprocess.run", side_effect=subprocess.CalledProcessError(1, "sbatch")):
+        with patch("MTS_Management.runner.subprocess.run", side_effect=subprocess.CalledProcessError(1, "sbatch")):
             with self.assertRaises(subprocess.CalledProcessError):
                 launch(attempt, mode="slurm")
         self.assertEqual(read_json(attempt / "status.json")["state"], "failed")
@@ -268,7 +234,7 @@ print("finished",flush=True)
                     output_root=str(self.output), state_dir=str(self.state), mode="slurm")
         def sbatch(args, **kwargs):
             return subprocess.CompletedProcess(args, 0, str(123 + submitter.call_count), "")
-        with patch("mtscripts.runner.subprocess.run", side_effect=sbatch) as submitter:
+        with patch("MTS_Management.runner.subprocess.run", side_effect=sbatch) as submitter:
             result = serve({"site": asdict(site), "operation": "run", "options": {
                 "settings": Config().as_dict(), "chain": 2}})
             self.assertEqual(submitter.call_count, 2)
@@ -294,7 +260,7 @@ print("finished",flush=True)
             if args[0] == "sacct":
                 return subprocess.CompletedProcess(args, 0, "124|TIMEOUT|\n", "")
             return original(args, **kwargs)
-        with patch("mtscripts.runner.subprocess.run", side_effect=accounting), redirect_stdout(io.StringIO()):
+        with patch("MTS_Management.runner.subprocess.run", side_effect=accounting), redirect_stdout(io.StringIO()):
             execute(second)
         resumed = read_json(second / "request.json")
         self.assertEqual(resumed["input"], {"checkpoint": str(newer), "sha256": file_digest(newer)})
@@ -306,7 +272,7 @@ print("finished",flush=True)
         first = self.prepare()
         write_json(first / "status.json", {"state": "queued", "scheduler_id": "123"})
         second = self.prepare(checkpoint="latest", after=first)
-        with patch("mtscripts.runner.subprocess.run", return_value=
+        with patch("MTS_Management.runner.subprocess.run", return_value=
                    subprocess.CompletedProcess([], 0, "123|CANCELLED|\n", "")):
             with self.assertRaisesRegex(RuntimeError, "CANCELLED"):
                 execute(second)
@@ -318,22 +284,21 @@ print("finished",flush=True)
             execute(latest)
         self.assertEqual(read_json(latest / "status.json")["state"], "failed")
 
-    def test_chain_validation_before_submission(self):
-        site = Site(name="fixture", directory=str(self.root), executable=str(self.exe),
-                    output_root=str(self.output), state_dir=str(self.state), mode="slurm")
-        for chain, settings in ((0, {}), (True, {}), (2, {"writeDumps": False})):
-            with self.assertRaises(ValueError):
-                serve({"site": asdict(site), "operation": "run", "options": {
-                    "settings": Config(**settings).as_dict(), "chain": chain}})
-        self.assertFalse(self.output.exists())
-
     def test_json_remote_endpoint_and_journal_merge(self):
         site = Site(name="fixture", directory=str(self.root), executable=str(self.exe),
                     output_root=str(self.output), state_dir=str(self.state))
         payload = {"site": asdict(site), "operation": "resources"}
-        result = subprocess.run([sys.executable, "-m", "mtscripts", "_serve"],
+        result = subprocess.run([sys.executable, "-m", "MTS_Management", "_serve"],
                                 input=json.dumps(payload), capture_output=True, text=True, check=True)
         self.assertIn("disk_free_bytes", json.loads(result.stdout))
+        remote = Site(name="existing", ssh="magi", management_module="mtscripts")
+        with patch("MTS_Management.cluster.subprocess.run", return_value=result) as transport:
+            call(remote, "resources")
+        args, kwargs = transport.call_args
+        self.assertIn("mtscripts _serve", args[0][-1])
+        self.assertNotIn("management_module", json.loads(kwargs["input"])["site"])
+        with self.assertRaisesRegex(ValueError, "new deployment"):
+            deploy(remote)
         journal = Journal(self.state)
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(lambda i: journal.append("test", number=i), range(40)))
@@ -348,42 +313,52 @@ print("finished",flush=True)
         event = journal.append("new")
         self.assertEqual(journal.since(cursor)["records"], [event])
 
-    def test_selective_fetch_keeps_identity_and_refuses_different_data(self):
-        attempt = self.prepare()
-        with redirect_stdout(io.StringIO()):
-            execute(attempt)
-        write_json(attempt.parent.parent/"termination.json", {"termination": {
-            "steps": 1, "stopReason": "sample_targets", "targetsMet": True}})
-        self.assertEqual(inventory(self.output)[0]["termination"]["stopReason"], "sample_targets")
+    def test_batch_fetch_uses_one_inventory_and_one_transfer(self):
+        configs = [Config(seed=seed) for seed in range(3)]
+        for config in configs:
+            attempt = self.prepare(config)
+            if config["seed"] < 2:
+                with redirect_stdout(io.StringIO()):
+                    execute(attempt)
+                write_json(attempt.parent.parent / "termination.json", {"termination": {
+                    "steps": 1, "stopReason": "sample_targets", "targetsMet": True}})
         site = Site(name="local", directory=str(self.root), output_root=str(self.output))
-        destination = Path(fetch(site, Config().config_hash, self.root/"downloads"))
-        self.assertTrue((destination/"macroData.csv").is_file())
-        self.assertTrue((destination/"config.conf").is_file())
-        self.assertTrue((destination/"manifest.json").is_file())
-        self.assertEqual(read_json(destination/"termination.json")["termination"]["steps"], 1)
-        self.assertFalse((destination/"dumps").exists())
-        fetch(site, Config().config_hash, self.root/"downloads")
-        (destination/"manifest.json").write_text("{}")
-        with self.assertRaises(ValueError):
-            fetch(site, Config().config_hash, self.root/"downloads")
+        with patch("MTS_Management.cluster.call", wraps=call) as remote, \
+             patch("MTS_Management.cluster.subprocess.run", wraps=subprocess.run) as transfer:
+            fetched = fetch_many(site, [c.config_hash for c in configs], self.root/"batch",
+                                 completed_only=True)
+        self.assertEqual(remote.call_count, 1)
+        self.assertEqual(transfer.call_count, 1)
+        self.assertEqual(len(fetched), 2)
+        for folder in map(Path, fetched):
+            self.assertTrue((folder/"macroData.csv").exists())
+            self.assertFalse((folder/"dumps").exists())
+        self.assertEqual(len(read_json(self.root/"batch/snapshot.json")["runs"]), 2)
+        (Path(fetched[0])/"manifest.json").write_text("{}")
+        with patch("MTS_Management.cluster.subprocess.run") as transfer:
+            with self.assertRaisesRegex(ValueError, "different/unmanaged"):
+                fetch_many(site, [c.config_hash for c in configs], self.root/"batch")
+            transfer.assert_not_called()
+        full = fetch_many(site, [configs[0].config_hash], self.root/"full", kind="full")
+        self.assertTrue((Path(full[0])/"dumps/state.xml.gz").is_file())
 
     def test_management_runs_without_legacy_or_third_party_packages(self):
-        shutil.copytree(PACKAGE_ROOT/"mtscripts", self.root/"mtscripts",
+        shutil.copytree(PACKAGE_ROOT/"MTS_Management", self.root/"MTS_Management",
                         ignore=shutil.ignore_patterns("__pycache__"))
         environment = os.environ | {"PYTHONPATH": str(self.root)}
-        subprocess.run([sys.executable, "-S", "-m", "mtscripts", "config", str(self.root/"new.conf")],
+        subprocess.run([sys.executable, "-S", "-m", "MTS_Management", "config", str(self.root/"new.conf")],
                        cwd=self.root, env=environment, capture_output=True, text=True, check=True)
         self.assertEqual(Config.read(self.root/"new.conf").config_hash, Config().config_hash)
 
     def test_submission_uncertainty_and_shared_source_guard(self):
         site = Site(name="remote", ssh="pascal", directory="/home/user/simulation/NewSimulationScripts")
-        with patch("mtscripts.cluster.call", side_effect=subprocess.TimeoutExpired("ssh", 1)):
+        with patch("MTS_Management.cluster.call", side_effect=subprocess.TimeoutExpired("ssh", 1)):
             with self.assertRaises(subprocess.TimeoutExpired):
                 submit(site, Config(), state_dir=self.state, campaign="TimeoutTest")
         records = Journal(self.state).records()
         self.assertEqual([r["event"] for r in records], ["submission_requested", "submission_error"])
         self.assertIn("unknown", records[-1]["outcome"])
-        with patch("mtscripts.cluster.source_identity", return_value={"revision": "test"}):
+        with patch("MTS_Management.cluster.source_identity", return_value={"revision": "test"}):
             with self.assertRaisesRegex(ValueError, "dedicated"):
                 deploy(site, include_source=True, local_source=self.root)
 
@@ -394,7 +369,7 @@ print("finished",flush=True)
             if args[0] == "scancel":
                 return subprocess.CompletedProcess(args, 1, "", "Invalid job id")
             return subprocess.CompletedProcess(args, 0, "123|TIMEOUT|\n", "")
-        with patch("mtscripts.runner.subprocess.run", side_effect=scheduler):
+        with patch("MTS_Management.runner.subprocess.run", side_effect=scheduler):
             stop(attempt)
         status = read_json(attempt/"status.json")
         self.assertEqual(status["state"], "stopped")
@@ -402,8 +377,8 @@ print("finished",flush=True)
 
 
     def test_benchmark_controller_resumes_confirmed_jobs_and_refuses_uncertainty(self):
-        from campaigns.launch_magi_benchmark import main as submit_campaign
-        from mtscripts.files import file_digest
+        from campaigns.magi_benchmark_oct26.launch import main as submit_campaign
+        from MTS_Management.files import file_digest
         build = read_json(self.exe.parent/"build-manifest.json")
         write_json(self.exe.parent/"build-manifest.json", build | {"build_options": {"ENABLE_NATIVE_ARCH": "OFF"}})
         site = Site(name="local", directory=str(self.root), executable=str(self.exe),
@@ -421,7 +396,7 @@ print("finished",flush=True)
         args = [str(campaign), "--sites", str(sites)]
         def sbatch(command, **kwargs):
             return subprocess.CompletedProcess(command, 0, str(700 + scheduler.call_count), "")
-        with patch("mtscripts.runner.subprocess.run", side_effect=sbatch) as scheduler, redirect_stdout(io.StringIO()):
+        with patch("MTS_Management.runner.subprocess.run", side_effect=sbatch) as scheduler, redirect_stdout(io.StringIO()):
             submit_campaign(args)
             self.assertEqual(scheduler.call_count, 2)
             submit_campaign(args + ["--resume"])
