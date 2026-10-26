@@ -29,7 +29,8 @@ mts status overview --site local
 ```
 
 The build requires CMake, a C++17 compiler, OpenMP and zlib. The simulator source
-must be on its `main` branch with committed build inputs. The supplied smoke
+must use committed build inputs on `main` or a pinned commit verified to belong
+to `origin/main` (as in a Git submodule). The supplied smoke
 configuration runs a small system to check the installation.
 
 Local paths are configured in [sites.toml](sites.toml). Its default local profile

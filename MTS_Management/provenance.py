@@ -43,6 +43,13 @@ def source_identity(source):
     if (source / ".git").exists():
         revision = command(["git", "-C", str(source), "rev-parse", "HEAD"])
         branch = command(["git", "-C", str(source), "branch", "--show-current"])
+        if not branch:
+            # Submodules check out pinned commits. Verify mainline ancestry instead
+            # of switching branches or changing the user's selected source revision.
+            mainline = subprocess.run(["git", "-C", str(source), "merge-base", "--is-ancestor",
+                                       revision, "refs/remotes/origin/main"], capture_output=True)
+            if mainline.returncode == 0:
+                branch = "main"
         if branch != "main":
             raise ValueError(f"New simulations require MTS2D main; found {branch!r}")
         if command(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no",
