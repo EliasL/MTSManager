@@ -4,7 +4,7 @@
 [sites.local]
 directory = "."
 source = "../MTS2D"
-executable = "build/MTS2D"
+executable = "../MTS2D/build/release/MTS2D"
 output_root = "output"
 state_dir = ".state"
 mode = "foreground"
@@ -56,6 +56,7 @@ ssh = "schwartz"
 management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
 directory = "~/simulation/NewSimulationScripts"
 source = "../MTS2D-current-11100d1"
+executable = "build/MTS2D" # Existing deployment.
 python = "python3"
 output_root = "/data2/elundheim/MTS2D_current_output"
 mode = "detached"
@@ -66,6 +67,7 @@ ssh = "jeanZay"
 management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
 directory = "~/simulation/NewSimulationScripts"
 source = "../MTS2D-current-11100d1"
+executable = "build/MTS2D" # Existing deployment.
 python = "python3" # configure the Python/compiler module environment below if needed
 output_root = "/lustre/fswork/projects/rech/bph/uog82gz/MTS2D_current_output"
 mode = "slurm"

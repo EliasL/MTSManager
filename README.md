@@ -34,8 +34,11 @@ to `origin/main` (as in a Git submodule). The supplied smoke
 configuration runs a small system to check the installation.
 
 Local paths are configured in [sites.toml](sites.toml). Its default local profile
-uses `../MTS2D` as the source, `build/MTS2D` as the executable, and `output/` for
-results. Paths in a local profile are relative to the site file. Recreate CMake
+uses `../MTS2D` as the source, `../MTS2D/build/release/MTS2D` as the executable,
+and `output/` for results. The GUI, installer and managed builds share this Release executable.
+If `executable` is omitted, it defaults to `build/release/MTS2D` inside the
+configured `source` directory. An explicit path can select an existing deployment.
+Paths in a local profile are relative to the site file. Recreate CMake
 build directories and editable installations if you move the repositories.
 
 Use `mts --help` or `mts COMMAND --help` for command options.
@@ -76,7 +79,7 @@ from MTS_Management import Config, sweep, run
 
 base = Config(rows=10, cols=10, boundary="periodic", totalLoad=0.01)
 configs = sweep(base, L=[10, 20], seed=[0, 1])
-run(configs[0], executable="build/MTS2D", output_root="output",
+run(configs[0], executable="../MTS2D/build/release/MTS2D", output_root="output",
     state_dir=".state", campaign="Example")
 ```
 
@@ -138,8 +141,9 @@ Replace the alias, paths and scheduler resources with values for your cluster.
 Use `mode = "detached"` on hosts without Slurm. A site's `setup` string can load
 compiler and scheduler modules; it must leave standard output quiet. Set
 `native_arch = false` when build and execution machines may have different CPUs.
-The supplied remote profiles describe specific installations and need reviewing
-before use. `management_module` must match the module installed on that host;
+Builds are compiled on the execution host; local binaries and CMake caches are
+not uploaded. The supplied remote profiles describe specific installations and
+need reviewing before use. `management_module` must match the module installed on that host;
 new deployments use `MTS_Management`.
 
 After configuring a site:
@@ -214,4 +218,5 @@ python -m unittest discover -s tests -v
 
 The suite covers run identity, execution history, process control, scheduler
 continuation and data integrity. Small real-simulator checks run when the isolated
-`build/MTS2D` executable is available. Scheduler tests do not submit cluster jobs.
+`../MTS2D/build/release/MTS2D` executable is available. Scheduler tests do not
+submit cluster jobs.

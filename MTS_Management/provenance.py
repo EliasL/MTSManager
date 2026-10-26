@@ -96,6 +96,7 @@ def build(source, build_dir, *, jobs=2, native_arch=False):
     verify_schema(source)
     subprocess.run(["cmake", "-S", str(source), "-B", str(build_dir),
                     "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                     f"-DENABLE_NATIVE_ARCH={'ON' if native_arch else 'OFF'}"],
                    check=True, stdout=sys.stderr)
     subprocess.run(["cmake", "--build", str(build_dir), "--target", "MTS2D",

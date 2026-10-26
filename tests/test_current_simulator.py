@@ -7,12 +7,13 @@ import tempfile
 import unittest
 
 from MTS_Management.config import Config
+from MTS_Management.cluster import load_sites, paths
 from MTS_Management.data import read_macros
 from MTS_Management.files import read_json
 from MTS_Management.inventory import inventory
 from MTS_Management.runner import PACKAGE_ROOT, execute, prepare
 
-EXE = PACKAGE_ROOT / "build/MTS2D"
+EXE = Path(paths(load_sites(PACKAGE_ROOT / "sites.toml")["local"])["executable"])
 
 
 @unittest.skipUnless(EXE.exists() and (EXE.parent/"build-manifest.json").exists(),

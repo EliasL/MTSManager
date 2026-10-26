@@ -29,7 +29,7 @@ class Site:
     python: str = "python3"
     management_module: str = "MTS_Management"
     source: str = "../MTS2D"
-    executable: str = "build/MTS2D"
+    executable: str = ""  # Default: source/build/release/MTS2D on the execution host.
     output_root: str = "output"
     state_dir: str = ".state"
     mode: str = "detached"
@@ -83,8 +83,10 @@ def paths(site):
     def resolve(value):
         p = Path(value).expanduser()
         return str((p if p.is_absolute() else base / p).resolve())
-    return {k: resolve(getattr(site, k)) for k in
-            ("source", "executable", "output_root", "state_dir")}
+    result = {k: resolve(getattr(site, k)) for k in ("source", "output_root", "state_dir")}
+    result["executable"] = (resolve(site.executable) if site.executable else
+                            str(Path(result["source"]) / "build/release/MTS2D"))
+    return result
 
 
 def scheduler_jobs():
