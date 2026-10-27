@@ -30,7 +30,7 @@ class Site:
     directory: str = "."
     python: str = "python3"
     management_module: str = "MTS_Management"
-    manager_directory: str = ""  # Optional immutable package location; worker paths remain unchanged.
+    manager_directory: str = ""  # Optional shared package location; simulator paths remain unchanged.
     source: str = "../MTS2D"
     executable: str = ""  # Default: source/build/release/MTS2D on the execution host.
     output_root: str = "output"

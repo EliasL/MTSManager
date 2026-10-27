@@ -1,8 +1,7 @@
-"""Deploy immutable manager versions without rewriting existing worker packages."""
+"""Update a shared manager installation on each execution host."""
 
 from dataclasses import replace
 from pathlib import Path
-import secrets
 import shlex
 import subprocess
 
@@ -34,11 +33,11 @@ def update_managers(site_file, *, log=print):
             log(result.stderr.rstrip())
     for host, profiles in groups.items():
         log(f"Updating manager on {host}")
-        directory = "~/.local/share/mts/managers/" + expected["sha256"] + "-" + secrets.token_hex(4)
+        directory = "~/.local/share/mts/manager"
         try:
             run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
                  "umask 077; mkdir -p -- " + shell_path(directory)])
-            run(["rsync", "-a", "--itemize-changes", "--exclude=__pycache__", "--include=*.py",
+            run(["rsync", "-a", "--delete", "--delete-excluded", "--itemize-changes", "--exclude=__pycache__", "--include=*.py",
                  "--include=*.json", "--exclude=*", "-e", "ssh -T -o BatchMode=yes -o ConnectTimeout=8",
                  str(PACKAGE_ROOT / "MTS_Management") + "/", host + ":" + directory + "/MTS_Management/"])
         except Exception as error:
@@ -58,7 +57,7 @@ def update_managers(site_file, *, log=print):
                     registry[manager_key(site)] = {"directory": directory, "scripts": expected}
                     write_json(registry_file, registry)
                 updated.append(site.name)
-                log(f"{site.name}: manager activated; existing worker directories retained")
+                log(f"{site.name}: shared manager updated and verified")
             except Exception as error:
                 detail = str(error) + ("\n" + str(error.stderr) if getattr(error, "stderr", None) else "")
                 errors[site.name] = detail

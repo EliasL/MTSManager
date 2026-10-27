@@ -65,7 +65,7 @@ class DeploymentTests(unittest.TestCase):
             sites_file.write_text(text)
             def verify(site, operation, **options):
                 self.assertEqual(site.directory, "~/workers/" + site.name)
-                self.assertTrue(site.manager_directory.startswith("~/.local/share/mts/managers/"))
+                self.assertEqual(site.manager_directory, "~/.local/share/mts/manager")
                 if site.name == "second":
                     raise ValueError("verification failed")
                 return {"scripts": expected}
@@ -73,6 +73,7 @@ class DeploymentTests(unittest.TestCase):
                        subprocess.CompletedProcess([], 0, "", "")), \
                     patch("MTS_Management.deployments.call", side_effect=verify):
                 result = update_managers(sites_file, log=lambda _: None)
+                update_managers(sites_file, log=lambda _: None)
             loaded = load_sites(sites_file)
             self.assertTrue(loaded["first"].manager_directory)
             self.assertEqual(loaded["second"].manager_directory, "")
@@ -114,6 +115,19 @@ print("finished",flush=True)
     def prepare(self, config=None, **kwargs):
         return prepare(config or Config(), executable=self.exe, output_root=self.output,
                        state_dir=self.state, campaign="Test", **kwargs)
+
+    def test_manager_update_allows_prepared_job_and_records_execution_version(self):
+        attempt = self.prepare()
+        submitted = read_json(attempt / "request.json")["scripts"]
+        changed = {"version": "updated", "sha256": "different-manager-source"}
+        with patch("MTS_Management.runner.scripts_identity", return_value=changed), \
+                patch("MTS_Management.runner.process_token", return_value="fixture"), \
+                redirect_stdout(io.StringIO()):
+            execute(attempt)
+        status = read_json(attempt / "status.json")
+        self.assertEqual(status["state"], "finished")
+        self.assertEqual(status["execution_scripts"], changed)
+        self.assertEqual(read_json(attempt / "request.json")["scripts"], submitted)
 
     def test_inventory_cache_reuses_finished_runs_until_resume_or_hard_refresh(self):
         attempt = self.prepare()

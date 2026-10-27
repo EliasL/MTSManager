@@ -137,13 +137,19 @@ a separate `--refresh-sizes` option. These commands require the updated manager
 on the execution host.
 
 The desktop application's Update all server managers action deploys the installed
-local package into a new directory under `~/.local/share/mts/managers/` on each
-SSH destination. A matching package identity is required before a profile is
-activated. Active locations are recorded beside the site file in
-`.state/manager-deployments.json`; `load_sites` applies them to subsequent calls.
-The profile's working directory, simulator paths and existing worker packages
-remain unchanged. New workers use the selected manager package, while previously
-submitted workers retain their original package.
+local package into the shared `~/.local/share/mts/manager/` installation on each
+SSH destination. Repeated updates replace this installation, including obsolete
+package files. The package identity is verified before recording a profile's
+location in `.state/manager-deployments.json`; `load_sites` applies these locations
+to subsequent calls. Updates leave other manager directories, simulator builds
+and simulation data untouched.
+
+Job requests record the manager identity at submission. Execution records its
+manager identity as `execution_scripts` in the attempt status and running event.
+The identities may differ: manager updates do not invalidate submitted jobs.
+Executable, configuration and checkpoint identity checks remain enforced.
+Manager changes must remain compatible with saved job requests. Existing
+submission scripts retain their recorded working directory.
 
 Execution history is stored in `.state/job-log.jsonl`. Keep it and run manifests
 with your results; they record requests, starts, outcomes and execution identities.

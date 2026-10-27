@@ -219,8 +219,7 @@ def execute(attempt):
                 raise ValueError("Configuration changed after submission")
             if executable_identity(request["executable"]) != request["build"]:
                 raise ValueError("Executable/build manifest changed after submission")
-            if scripts_identity() != request["scripts"]:
-                raise ValueError("Scripts changed after submission")
+            execution_scripts = scripts_identity()
             if request.get("predecessor"):
                 previous = Path(request["predecessor"])
                 job = read_json(previous / "status.json")["scheduler_id"]
@@ -272,7 +271,7 @@ def execute(attempt):
                                          stderr=subprocess.STDOUT, start_new_session=True)
                 fields = {"pid": child.pid, "process_token": process_token(child.pid),
                           "runner_pid": os.getpid(), "runner_token": process_token(os.getpid()),
-                          "command": cmd, "started_at": now()}
+                          "command": cmd, "started_at": now(), "execution_scripts": execution_scripts}
                 fields.update(cpu_allocation=allocation,
                               environment={k: v for k, v in environment.items()
                                            if k.startswith(("OMP_", "GOMP_", "KMP_"))})
