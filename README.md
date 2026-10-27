@@ -114,6 +114,37 @@ its displayed or full hash. Use a separate output root to repeat a completed run
 or to compare different simulator builds. Renaming a managed run folder breaks
 its saved identity checks.
 
+Each output root has a shared `.inventory.sqlite3` database. Normal inventory
+refreshes reread unfinished runs and reuse finished records without opening their
+run files. Preparing a new attempt invalidates its cached record before the
+attempt is created. This policy assumes that runs are restarted through
+MTSManager. Concurrent refreshes are serialized; lifecycle revision checks
+prevent a refresh from restoring a finished record invalidated by a restart.
+Only the last successful full-update time is stored.
+
+Read an existing database without scanning run files with
+`mts inventory-cache --site cluster`. Invalidated records appear in its `pending`
+list until refreshed. Use `mts inventory-update --site cluster` to refresh the
+database and atomically export `.inventory.json`; its response gives the export
+path, successful-update time and record counts. Transfer this JSON export with
+rsync rather than copying a live SQLite database and its journal. Other clients
+can read the shared database immediately, with its recorded update time.
+
+`mts inventory --site cluster --hard-refresh` rebuilds the run index and rereads
+all configurations, manifests, attempts and progress, including finished runs.
+Use it after changes made outside MTSManager. Directory-size estimation remains
+a separate `--refresh-sizes` option. These commands require the updated manager
+on the execution host.
+
+The desktop application's Update all server managers action deploys the installed
+local package into a new directory under `~/.local/share/mts/managers/` on each
+SSH destination. A matching package identity is required before a profile is
+activated. Active locations are recorded beside the site file in
+`.state/manager-deployments.json`; `load_sites` applies them to subsequent calls.
+The profile's working directory, simulator paths and existing worker packages
+remain unchanged. New workers use the selected manager package, while previously
+submitted workers retain their original package.
+
 Execution history is stored in `.state/job-log.jsonl`. Keep it and run manifests
 with your results; they record requests, starts, outcomes and execution identities.
 

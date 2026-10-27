@@ -1,6 +1,7 @@
 """Small file primitives shared by the runner, journal and inventory."""
 
 from contextlib import contextmanager
+from concurrent.futures import CancelledError
 from datetime import datetime
 import fcntl
 import hashlib
@@ -53,11 +54,20 @@ def write_json(path, value):
 
 
 @contextmanager
-def locked(path, *, blocking=True):
+def locked(path, *, blocking=True, cancel=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise CancelledError("Inventory aborted while waiting for another refresh")
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if not blocking or cancel is not None else 0))
+                break
+            except BlockingIOError:
+                if cancel is None or not blocking:
+                    raise
+                cancel.wait(0.1)
         try:
             yield
         finally:

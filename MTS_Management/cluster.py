@@ -1,6 +1,6 @@
 """OpenSSH transport; the same installed package handles work on each host."""
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 import getpass
 import json
@@ -11,11 +11,13 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 from .config import Config, DEFAULTS
 from .files import canonical, digest, file_digest, locked, now, read_json, write_json
 from .inventory import inventory, rebuild_index, resources
+from .inventory_cache import export as export_inventory, snapshot as cached_inventory
 from .journal import Journal
 from .provenance import build, source_files, source_identity
 from .runner import PACKAGE_ROOT, launch, prepare, stop
@@ -28,6 +30,7 @@ class Site:
     directory: str = "."
     python: str = "python3"
     management_module: str = "MTS_Management"
+    manager_directory: str = ""  # Optional immutable package location; worker paths remain unchanged.
     source: str = "../MTS2D"
     executable: str = ""  # Default: source/build/release/MTS2D on the execution host.
     output_root: str = "output"
@@ -55,16 +58,24 @@ class Site:
             raise ValueError("Environment keys must be variable names and values must be strings")
 
 
+def manager_key(site):
+    return digest({"ssh": site.ssh, "directory": site.directory})
+
+
 def load_sites(path):
     path = Path(path).resolve()
     data = tomllib.loads(path.read_text())
     if data.keys() != {"sites"}:
         raise ValueError("Site configuration must contain only [sites.NAME] sections")
     sites = {}
+    deployments_file = path.parent / ".state/manager-deployments.json"
+    deployments = read_json(deployments_file) if deployments_file.exists() else {}
     for name, settings in data["sites"].items():
         site = Site(name=name, **settings)
         if not site.ssh:
             site.directory = str((path.parent / site.directory).resolve())
+        elif manager_key(site) in deployments:
+            site.manager_directory = deployments[manager_key(site)]["directory"]
         sites[name] = site
     return sites
 
@@ -101,7 +112,7 @@ def scheduler_jobs():
     return rows
 
 
-def serve(payload):
+def serve(payload, *, cancel=None):
     """One request per process. Stdout is reserved for the JSON response."""
     site = Site(**payload["site"])
     p = paths(site)
@@ -115,7 +126,17 @@ def serve(payload):
     if op == "reindex":
         return rebuild_index(p["output_root"])
     if op == "inventory":
-        return inventory(p["output_root"], **options)
+        return inventory(p["output_root"], cancel=cancel, **options)
+    if op == "inventory_cached":
+        if options:
+            raise ValueError("Cached inventory reads do not accept refresh options")
+        return cached_inventory(p["output_root"])
+    if op == "inventory_update":
+        if "config_hash" in options:
+            raise ValueError("Inventory database export requires a full refresh")
+        Path(p["output_root"]).mkdir(parents=True, exist_ok=True)
+        inventory(p["output_root"], cancel=cancel, **options)
+        return export_inventory(p["output_root"])
     if op == "resources":
         return resources(p["output_root"]) | {
             "scheduler": scheduler_jobs() if site.mode == "slurm" else None}
@@ -123,7 +144,8 @@ def serve(payload):
         return Journal(p["state_dir"]).since(**options)
     if op == "snapshot":
         return {"resources": serve(payload | {"operation": "resources", "options": {}}),
-                "inventory": inventory(p["output_root"], refresh_sizes=options.get("refresh_sizes", False)),
+                "inventory": inventory(p["output_root"], refresh_sizes=options.get("refresh_sizes", False),
+                                       hard_refresh=options.get("hard_refresh", False), cancel=cancel),
                 "journal": Journal(p["state_dir"]).since(options.get("journal_offset", 0))}
     if op == "build":
         return build(p["source"], Path(p["executable"]).parent,
@@ -168,23 +190,69 @@ def serve(payload):
     raise ValueError(f"Unknown remote operation: {op}")
 
 
-def call(site, operation, *, timeout=30, **options):
+def call(site, operation, *, timeout=30, log=None, cancel=None, **options):
     settings = asdict(site)
     module = settings.pop("management_module")  # Client transport setting, not remote job data.
+    manager_directory = settings.pop("manager_directory")
+    if manager_directory:
+        module = "MTS_Management"
     payload = {"site": settings, "operation": operation, "options": options}
+    if cancel is not None and cancel.is_set():
+        raise CancelledError("Operation aborted")
     if not site.ssh and not site.setup:
-        return serve(payload)
-    cmd = f"cd {shell_path(site.directory)} && {shlex.join([site.python, '-u', '-m', module, '_serve'])}"
+        return serve(payload, cancel=cancel)
+    python = [site.python, '-u', '-m', module, '_serve']
+    reader = site.ssh and operation in {"inventory", "inventory_cached", "inventory_update", "logs"}
+    if reader or manager_directory:
+        # Bound a remote reader even if its SSH connection disappears.
+        code = "import os, runpy, signal, sys; "
+        if reader:
+            code += f"signal.alarm({max(1, int(timeout))}); "
+        if manager_directory:
+            code += f"sys.path.insert(0, os.path.expanduser({manager_directory!r})); "
+        code += f"sys.argv = [{module!r}, '_serve']; runpy.run_module({module!r}, run_name='__main__')"
+        python = [site.python, '-u', '-c', code]
+    cmd = f"cd {shell_path(site.directory)} && {shlex.join(python)}"
     if site.setup:
         cmd = site.setup + "\n" + cmd
     args = (["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
              site.ssh, "bash -lc " + shlex.quote("set -e\n" + cmd)] if site.ssh else
             ["bash", "-lc", "set -e\n" + site.setup + "\ncd " + shell_path(site.directory) +
              "\n" + shlex.join([sys.executable, "-u", "-m", module, "_serve"])])
-    result = subprocess.run(args,
-                            input=canonical(payload).decode(), capture_output=True, text=True,
-                            timeout=timeout, check=True)
-    return json.loads(result.stdout)
+    if log:
+        log("$ " + shlex.join(args))
+    started = time.monotonic()
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as process:
+        data = canonical(payload).decode()
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise CancelledError("Operation aborted; previous cached inventory retained")
+                if time.monotonic() - started >= timeout:
+                    raise subprocess.TimeoutExpired(args, timeout)
+                try:
+                    stdout, stderr = process.communicate(data, timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    data = None
+        except BaseException as error:
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            if isinstance(error, subprocess.TimeoutExpired):
+                error.output, error.stderr = stdout, stderr
+            raise
+        if log and stderr.strip():
+            log(stderr.rstrip())
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, args, output=stdout, stderr=stderr)
+    if log:
+        log(f"Received {len(stdout.encode())} bytes in {time.monotonic() - started:.2f} s")
+    return json.loads(stdout)
 
 
 def across(sites, operation, *, per_site=None, **options):

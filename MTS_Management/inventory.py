@@ -1,6 +1,7 @@
 """Indexed run discovery and bounded progress/storage inspection."""
 
 import csv
+from concurrent.futures import CancelledError
 from collections import deque
 import math
 import os
@@ -10,6 +11,7 @@ import time
 
 from .config import Config
 from .files import file_digest, locked, now, read_json, write_json
+from .inventory_cache import invalidate, publish, records
 from .runner import process_token
 
 
@@ -103,41 +105,60 @@ def rebuild_index(output_root):
                 raise ValueError(f"Duplicate configuration directories: {folder}")
             index[config.config_hash] = folder.name
         write_json(root / ".run-index.json", index)
+        invalidate(root)
     return index
 
 
-def inventory(output_root, *, config_hash=None, refresh_sizes=False):
+def inventory(output_root, *, config_hash=None, refresh_sizes=False, hard_refresh=False, cancel=None):
     root = Path(output_root).resolve()
     if not root.exists():
         return []
     index_file = root / ".run-index.json"
-    index = read_json(index_file) if index_file.exists() else rebuild_index(root)
+    if not index_file.exists() or (hard_refresh and config_hash is None):
+        rebuild_index(root)
+    # Serialise refreshes, without blocking lifecycle invalidation or cached readers.
+    with locked(root / ".inventory.lock", cancel=cancel):
+        return _inventory(root, config_hash=config_hash, refresh_sizes=refresh_sizes,
+                          hard_refresh=hard_refresh, cancel=cancel)
+
+
+def _inventory(root, *, config_hash, refresh_sizes, hard_refresh, cancel):
+    index = read_json(root / ".run-index.json")
     if config_hash and (len(config_hash) < 20 or any(c not in "0123456789abcdef" for c in config_hash)):
         raise ValueError("Use at least the complete 20-character configuration hash")
     matches = [h for h in index if not config_hash or h.startswith(config_hash)]
     if config_hash and len(matches) > 1:
         raise ValueError("Ambiguous configuration hash")
-    result = []
+    cached = records(root)
+    result, updates, revisions = [], [], {}
     for h in matches:
+        if cancel is not None and cancel.is_set():
+            raise CancelledError("Inventory aborted")
         folder = root / index[h]
+        revision, row = cached.get(h, (0, None))
+        revisions[h] = revision
+        if (not hard_refresh and not refresh_sizes and row is not None and row["folder"] == str(folder)
+                and row["status"]["state"] == "finished" and not row["queued_continuations"]):
+            result.append(row)
+            continue
         config = Config.read(folder / "config.conf", expected_name=folder.name)
         if config.config_hash != h:
             raise ValueError(f"Index/config mismatch: {folder}")
-        attempts = sorted((folder / "attempts").iterdir(),
-                          key=lambda p: read_json(p / "request.json")["created_at"])
+        requests = {attempt: read_json(attempt / "request.json") for attempt in (folder / "attempts").iterdir()}
+        attempts = sorted(requests, key=lambda p: requests[p]["created_at"])
         statuses = {a: read_json(a / "status.json") for a in attempts}
         active = [a for a in attempts if statuses[a]["state"] in {"running", "stopping"}]
         queued = [a for a in attempts if statuses[a]["state"] in {"prepared", "queued"}]
         attempt = (active[-1] if active else queued[0] if queued else attempts[-1]) if attempts else None
-        request = read_json(attempt / "request.json") if attempt else {}
-        status = read_json(attempt / "status.json") if attempt else {"state": "unknown"}
+        request = requests[attempt] if attempt else {}
+        status = statuses[attempt] if attempt else {"state": "unknown"}
         if status["state"] == "running" and "scheduler_id" not in status:
             status["process_alive"] = bool(status.get("process_token")) and (
                 process_token(status["pid"]) == status["process_token"])
         cache = folder / ".size-estimate.json"
         if refresh_sizes:
             write_json(cache, estimate_size(folder))
-        result.append({"config_hash": h, "folder": str(folder), "attempt": str(attempt) if attempt else None,
+        row = {"config_hash": h, "folder": str(folder), "attempt": str(attempt) if attempt else None,
                        "manifest_sha256": file_digest(folder / "manifest.json"),
                        "campaign": request.get("campaign"), "status": status,
                        "queued_continuations": len([a for a in queued if a != attempt]),
@@ -145,7 +166,12 @@ def inventory(output_root, *, config_hash=None, refresh_sizes=False):
                        "termination": read_json(folder / "termination.json")["termination"]
                            if status["state"] == "finished" and (folder / "termination.json").exists() else None,
                        "progress": progress(folder, config),
-                       "size": read_json(cache) if cache.exists() else None})
+                       "size": read_json(cache) if cache.exists() else None}
+        result.append(row)
+        updates.append(row)
+    if cancel is not None and cancel.is_set():
+        raise CancelledError("Inventory aborted")
+    publish(root, revisions, updates, full=config_hash is None)
     return result
 
 

@@ -49,16 +49,19 @@ def parser():
     c.add_argument("--name", required=True)
     c.add_argument("--base", type=Path, required=True)
     c.add_argument("--vary", action="append", required=True, help="e.g. 'seed=[0,1,2]'")
-    for name in ("build", "deploy", "inventory", "reindex", "info"):
+    for name in ("build", "deploy", "inventory", "inventory-cache", "inventory-update", "reindex", "info"):
         c = commands.add_parser(name)
         c.add_argument("--site", default="local")
         if name == "build":
             c.add_argument("--jobs", type=int, default=2)
         elif name == "deploy":
             c.add_argument("--source", type=Path, help="Also upload a dedicated current MTS2D snapshot")
-        elif name == "inventory":
-            c.add_argument("--hash")
+        elif name in {"inventory", "inventory-update"}:
+            if name == "inventory":
+                c.add_argument("--hash")
             c.add_argument("--refresh-sizes", action="store_true")
+            c.add_argument("--hard-refresh", action="store_true",
+                           help="Rebuild the index and reread completed runs")
     for name in ("run", "campaign"):
         c = commands.add_parser(name)
         c.add_argument("path", type=Path)
@@ -197,7 +200,12 @@ def main(argv=None):
     elif args.command == "build":
         result = call(site, "build", timeout=3600, jobs=args.jobs)
     elif args.command == "inventory":
-        result = call(site, "inventory", config_hash=args.hash, refresh_sizes=args.refresh_sizes)
+        result = call(site, "inventory", config_hash=args.hash, refresh_sizes=args.refresh_sizes,
+                      **({"hard_refresh": True} if args.hard_refresh else {}))
+    elif args.command == "inventory-cache":
+        result = call(site, "inventory_cached")
+    elif args.command == "inventory-update":
+        result = call(site, "inventory_update", refresh_sizes=args.refresh_sizes, hard_refresh=args.hard_refresh)
     elif args.command == "reindex":
         result = call(site, "reindex")
     elif args.command == "info":

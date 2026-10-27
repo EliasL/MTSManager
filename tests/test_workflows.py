@@ -20,6 +20,7 @@ from MTS_Management.config import Config, DEFAULTS
 from MTS_Management.data import read_macros
 from MTS_Management.files import digest, file_digest, read_json, write_json
 from MTS_Management.inventory import estimate_size, inventory, progress, rebuild_index
+from MTS_Management.inventory_cache import snapshot as cached_inventory
 from MTS_Management.journal import Journal
 from MTS_Management.provenance import build
 from MTS_Management.runner import PACKAGE_ROOT, execute, launch, prepare, run_many, stop
@@ -49,6 +50,37 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises((ValueError, TypeError)):
                 Config(**settings)
         Config(boundary="periodicAnchored", deformation="directDisplacement")
+
+
+class DeploymentTests(unittest.TestCase):
+    def test_manager_update_preserves_worker_paths_and_activates_only_verified_profiles(self):
+        from MTS_Management.cluster import load_sites
+        from MTS_Management.deployments import update_managers
+        from MTS_Management.provenance import scripts_identity
+        expected = scripts_identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            sites_file = Path(temporary) / "sites.toml"
+            text = '\n'.join(f'[sites.{name}]\nssh = "fixture"\ndirectory = "~/workers/{name}"\n'
+                             'management_module = "mtscripts"\n' for name in ("first", "second"))
+            sites_file.write_text(text)
+            def verify(site, operation, **options):
+                self.assertEqual(site.directory, "~/workers/" + site.name)
+                self.assertTrue(site.manager_directory.startswith("~/.local/share/mts/managers/"))
+                if site.name == "second":
+                    raise ValueError("verification failed")
+                return {"scripts": expected}
+            with patch("MTS_Management.deployments.subprocess.run", return_value=
+                       subprocess.CompletedProcess([], 0, "", "")), \
+                    patch("MTS_Management.deployments.call", side_effect=verify):
+                result = update_managers(sites_file, log=lambda _: None)
+            loaded = load_sites(sites_file)
+            self.assertTrue(loaded["first"].manager_directory)
+            self.assertEqual(loaded["second"].manager_directory, "")
+            self.assertEqual(loaded["first"].management_module, "mtscripts")
+            self.assertEqual(result["updated_sites"], ["first"])
+            self.assertIn("second", result["errors"])
+            self.assertEqual(sites_file.read_text(), text)
+
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
@@ -82,6 +114,48 @@ print("finished",flush=True)
     def prepare(self, config=None, **kwargs):
         return prepare(config or Config(), executable=self.exe, output_root=self.output,
                        state_dir=self.state, campaign="Test", **kwargs)
+
+    def test_inventory_cache_reuses_finished_runs_until_resume_or_hard_refresh(self):
+        attempt = self.prepare()
+        with redirect_stdout(io.StringIO()):
+            execute(attempt)
+        with patch("MTS_Management.inventory.read_json", wraps=read_json) as read:
+            first = inventory(self.output)
+        names = [Path(call.args[0]).name for call in read.call_args_list]
+        self.assertEqual(names.count("request.json"), 1)
+        self.assertEqual(names.count("status.json"), 1)
+        folder = attempt.parents[1]
+        (folder / "macroData.csv").write_text("load,value\n0,1\n0.75,2\n")
+        with patch("MTS_Management.inventory.Config.read", side_effect=AssertionError("Finished run reread")):
+            self.assertEqual(inventory(self.output), first)
+        self.assertEqual(inventory(self.output, hard_refresh=True)[0]["progress"]["fraction"], .75)
+        self.assertIsNotNone(cached_inventory(self.output)["updated_at"])
+        resumed = self.prepare(checkpoint=folder / "dumps/state.xml.gz")
+        cached = cached_inventory(self.output)
+        self.assertEqual(cached["rows"], [])
+        self.assertEqual(cached["pending"], [Config().config_hash])
+        self.assertEqual(inventory(self.output)[0]["status"]["state"], "prepared")
+        site = Site(name="fixture", directory=str(self.root), output_root=str(self.output))
+        exported = serve({"site": asdict(site), "operation": "inventory_update"})
+        self.assertEqual(read_json(exported["snapshot"])["rows"][0]["attempt"], str(resumed))
+        shutil.rmtree(folder)
+        self.assertEqual(inventory(self.output, hard_refresh=True), [])
+        self.assertEqual(cached_inventory(self.output)["pending"], [])
+
+    def test_inventory_cache_cannot_resurrect_finished_run_during_restart(self):
+        attempt = self.prepare()
+        with redirect_stdout(io.StringIO()):
+            execute(attempt)
+        inventory(self.output)
+        original_progress = progress
+        def restart_during_read(folder, config):
+            self.prepare(checkpoint=Path(folder) / "dumps/state.xml.gz")
+            return original_progress(folder, config)
+        with patch("MTS_Management.inventory.progress", side_effect=restart_during_read):
+            with self.assertRaisesRegex(RuntimeError, "changed during inventory"):
+                inventory(self.output, config_hash=Config().config_hash, hard_refresh=True)
+        self.assertEqual(cached_inventory(self.output)["rows"], [])
+        self.assertEqual(inventory(self.output)[0]["status"]["state"], "prepared")
 
     def test_site_build_setting_and_cache_override(self):
         cache = self.exe.parent / "CMakeCache.txt"
@@ -292,11 +366,14 @@ print("finished",flush=True)
                                 input=json.dumps(payload), capture_output=True, text=True, check=True)
         self.assertIn("disk_free_bytes", json.loads(result.stdout))
         remote = Site(name="existing", ssh="magi", management_module="mtscripts")
-        with patch("MTS_Management.cluster.subprocess.run", return_value=result) as transport:
+        with patch("MTS_Management.cluster.subprocess.Popen") as transport:
+            process = transport.return_value.__enter__.return_value
+            process.communicate.return_value = (result.stdout, result.stderr)
+            process.returncode = 0
             call(remote, "resources")
         args, kwargs = transport.call_args
         self.assertIn("mtscripts _serve", args[0][-1])
-        self.assertNotIn("management_module", json.loads(kwargs["input"])["site"])
+        self.assertNotIn("management_module", json.loads(process.communicate.call_args.args[0])["site"])
         with self.assertRaisesRegex(ValueError, "new deployment"):
             deploy(remote)
         journal = Journal(self.state)

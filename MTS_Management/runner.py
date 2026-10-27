@@ -15,6 +15,7 @@ import uuid
 from .config import Config
 from .files import digest, file_digest, locked, now, read_json, write_json
 from .journal import Journal
+from .inventory_cache import invalidate as invalidate_inventory
 from .provenance import executable_identity, scripts_identity
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -101,6 +102,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                        "campaign": campaign, "build": build})
         if checkpoint and not checkpoint.is_relative_to(folder):
             raise ValueError("Resume checkpoint must belong to this run")
+        invalidate_inventory(output_root, config.config_hash)
         attempt_id = uuid.uuid4().hex
         attempt = folder / "attempts" / attempt_id
         attempt.mkdir(parents=True)
@@ -132,6 +134,9 @@ def set_status(attempt, state, **fields):
     attempt = Path(attempt)
     with locked(attempt / ".status.lock"):
         status = read_json(attempt / "status.json")
+        if status["state"] == "finished" and state != "finished":
+            request = read_json(attempt / "request.json")
+            invalidate_inventory(attempt.parents[2], request["config_hash"])
         status.update(fields, state=state, updated_at=now())
         write_json(attempt / "status.json", status)
     request = read_json(attempt / "request.json")
