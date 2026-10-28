@@ -190,6 +190,13 @@ Retained copies are stored under `executables/<build-identity>/MTS2D` and cannot
 be rebuilt in place. Set a profile's `executable` to a retained path to select an
 older compiled version; checkpoint and configuration checks still apply.
 
+Retention applies when each run is submitted. A campaign name does not pin a
+binary for future submissions: select a retained executable in the site's
+profile to use one build throughout a campaign. Queued jobs keep their recorded
+binary after working builds change. The manager itself is not retained per job;
+updating it can affect queued workers, whose submission and execution manager
+identities are recorded separately.
+
 Builds are compiled on the execution host; local binaries and CMake caches are
 not uploaded. The supplied remote profiles describe specific installations and
 need reviewing before use. `management_module` must match the module installed on that host;
