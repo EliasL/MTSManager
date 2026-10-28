@@ -10,7 +10,7 @@ from types import MappingProxyType
 from .files import digest
 
 DEFAULTS = json.loads(Path(__file__).with_name("defaults.json").read_text())
-SCHEMA_REVISION = "11100d124633ca9f766abd9f255e418eac1409d5"
+SCHEMA_REVISION = "23e61580faa0c3a4d6c0ca7d730dfbe00d1da95f"
 
 
 class Config:
@@ -42,6 +42,7 @@ class Config:
             "reconnectionMethod": {"none", "edgeFlip", "delaunay"},
             "minimizer": {"LBFGS", "CG", "FIRE"},
             "preconditioner": {"none", "exactTangent", "diagonal"},
+            "tangentBackend": {"cholmod", "eigen"},
             "preconditionerUpdate": {"adaptive", "every", "frozen"},
             "energyFunction": {"contiSquare", "contiTriangular"},
             "meshDiagonal": {"major", "minor"},

@@ -68,6 +68,7 @@
   "stopAfterPlasticSteps": 0,
   "stopAfterSteps": 0,
   "stopWhen": "all",
+  "tangentBackend": "cholmod",
   "totalLoad": 1.0,
   "writeDebugVTUs": false,
   "writeDumps": true,

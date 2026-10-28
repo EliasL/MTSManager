@@ -11,14 +11,14 @@ from .provenance import scripts_identity
 from .runner import PACKAGE_ROOT
 
 
-def update_managers(site_file, *, log=print):
+def update_managers(site_file, *, log=print, host=None):
     """Deploy the installed manager once per SSH destination, then activate profiles."""
     site_file = Path(site_file).resolve()
     sites = load_sites(site_file)
     expected = scripts_identity()
     groups = {}
     for site in sites.values():
-        if site.ssh:
+        if site.ssh and (host is None or site.ssh == host):
             groups.setdefault(site.ssh, []).append(site)
     if not groups:
         raise ValueError("No remote server profiles are configured")
@@ -33,7 +33,13 @@ def update_managers(site_file, *, log=print):
             log(result.stderr.rstrip())
     for host, profiles in groups.items():
         log(f"Updating manager on {host}")
-        directory = "~/.local/share/mts/manager"
+        directories = {site.manager_directory for site in profiles if site.manager_directory}
+        if len(directories) > 1:
+            detail = "Profiles on this server specify different shared manager directories"
+            errors.update({site.name: detail for site in profiles})
+            log(f"{host}: deployment failed: {detail}")
+            continue
+        directory = next(iter(directories), "~/.local/share/mts/manager")
         try:
             run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
                  "umask 077; mkdir -p -- " + shell_path(directory)])
@@ -41,13 +47,15 @@ def update_managers(site_file, *, log=print):
                  "--include=*.json", "--exclude=*", "-e", "ssh -T -o BatchMode=yes -o ConnectTimeout=8",
                  str(PACKAGE_ROOT / "MTS_Management") + "/", host + ":" + directory + "/MTS_Management/"])
         except Exception as error:
-            detail = str(error) + ("\n" + str(error.stderr) if getattr(error, "stderr", None) else "")
+            detail = (error.stderr.strip() or f"Command failed (exit {error.returncode})") if isinstance(error, subprocess.CalledProcessError) else str(error)
             for site in profiles:
                 errors[site.name] = detail
             log(f"{host}: deployment failed: {detail}")
             continue
         for site in profiles:
             try:
+                run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", site.ssh,
+                     "umask 077; mkdir -p -- " + shell_path(site.directory)])
                 candidate = replace(site, manager_directory=directory)
                 info = call(candidate, "info", timeout=30, log=log)
                 if info["scripts"] != expected:
@@ -59,7 +67,7 @@ def update_managers(site_file, *, log=print):
                 updated.append(site.name)
                 log(f"{site.name}: shared manager updated and verified")
             except Exception as error:
-                detail = str(error) + ("\n" + str(error.stderr) if getattr(error, "stderr", None) else "")
+                detail = (error.stderr.strip() or f"Command failed (exit {error.returncode})") if isinstance(error, subprocess.CalledProcessError) else str(error)
                 errors[site.name] = detail
                 log(f"{site.name}: activation failed: {detail}")
     if not updated:

@@ -16,7 +16,7 @@ from .config import Config
 from .files import digest, file_digest, locked, now, read_json, write_json
 from .journal import Journal
 from .inventory_cache import invalidate as invalidate_inventory
-from .provenance import executable_identity, scripts_identity
+from .provenance import executable_identity, scripts_identity, retain_executable
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 ACTIVE = {"prepared", "queued", "running", "stopping"}
@@ -48,7 +48,7 @@ def cpu_allocation():
 
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
             checkpoint=None, site="local", environment=None, after=None):
-    executable = Path(executable).resolve()
+    executable = retain_executable(executable, Path(state_dir).resolve().parent / "executables")
     build = executable_identity(executable)
     output_root = Path(output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)

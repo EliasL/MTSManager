@@ -109,6 +109,9 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if args.command == "_serve":
         payload = json.load(sys.stdin)
+        if "reader_timeout" in payload:
+            import signal
+            signal.alarm(payload.pop("reader_timeout"))
         # Builds and third-party helpers may print; only the response is stdout.
         with redirect_stdout(sys.stderr):
             result = serve(payload)

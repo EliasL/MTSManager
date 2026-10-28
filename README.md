@@ -163,8 +163,9 @@ Configure an SSH alias in `~/.ssh/config`, then add a matching site profile to
 ```toml
 [sites.cluster]
 ssh = "my-cluster"
-directory = "~/simulation/MTSManager"
-source = "../MTS2D-source"
+directory = "~/simulation/MTS"
+source = "MTS2D"
+executable = "build/current/MTS2D"
 output_root = "~/MTS2D_output"
 mode = "slurm"
 native_arch = false
@@ -178,10 +179,25 @@ Replace the alias, paths and scheduler resources with values for your cluster.
 Use `mode = "detached"` on hosts without Slurm. A site's `setup` string can load
 compiler and scheduler modules; it must leave standard output quiet. Set
 `native_arch = false` when build and execution machines may have different CPUs.
+The standard remote workspace is `~/simulation/MTS`, containing one active
+`MTS2D` source tree. Source uploads verify the transferred snapshot and replace
+its tracked build inputs in place. Builds and source installation share a lock.
+Existing `~/simulation/MTS2D` and SimulationScripts installations remain separate.
+
+Every prepared job uses a retained copy of its executable and original build
+manifest. Working binaries are also retained before and after rebuilding.
+Retained copies are stored under `executables/<build-identity>/MTS2D` and cannot
+be rebuilt in place. Set a profile's `executable` to a retained path to select an
+older compiled version; checkpoint and configuration checks still apply.
+
 Builds are compiled on the execution host; local binaries and CMake caches are
 not uploaded. The supplied remote profiles describe specific installations and
 need reviewing before use. `management_module` must match the module installed on that host;
 new deployments use `MTS_Management`.
+Configurations explicitly record `tangentBackend`; the current default is
+`cholmod`, with `eigen` available in CHOLMOD-enabled builds. Configuration identity
+includes this choice. Saved campaign plans retain their recorded identities for
+monitoring; new submissions require the current complete configuration schema.
 
 After configuring a site:
 

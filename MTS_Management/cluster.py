@@ -8,6 +8,7 @@ import posixpath
 from pathlib import Path
 import re
 import shlex
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,7 @@ from .files import canonical, digest, file_digest, locked, now, read_json, write
 from .inventory import inventory, rebuild_index, resources
 from .inventory_cache import export as export_inventory, snapshot as cached_inventory
 from .journal import Journal
-from .provenance import build, source_files, source_identity
+from .provenance import build, install_source, source_archive, source_files, source_identity
 from .runner import PACKAGE_ROOT, launch, prepare, stop
 
 
@@ -27,6 +28,7 @@ from .runner import PACKAGE_ROOT, launch, prepare, stop
 class Site:
     name: str
     ssh: str = ""
+    disabled: bool = False
     directory: str = "."
     python: str = "python3"
     management_module: str = "MTS_Management"
@@ -49,6 +51,8 @@ class Site:
             raise ValueError("ssh must be an SSH config alias or user@hostname")
         if self.mode not in {"foreground", "detached", "slurm"}:
             raise ValueError("mode must be foreground, detached or slurm")
+        if type(self.disabled) is not bool:
+            raise TypeError("disabled must be a boolean")
         if type(self.native_arch) is not bool:
             raise TypeError("native_arch must be a boolean")
         if type(self.slurm_cpus_per_thread) is not int or self.slurm_cpus_per_thread < 1:
@@ -62,7 +66,7 @@ def manager_key(site):
     return digest({"ssh": site.ssh, "directory": site.directory})
 
 
-def load_sites(path):
+def load_sites(path, *, include_disabled=False):
     path = Path(path).resolve()
     data = tomllib.loads(path.read_text())
     if data.keys() != {"sites"}:
@@ -70,13 +74,17 @@ def load_sites(path):
     sites = {}
     deployments_file = path.parent / ".state/manager-deployments.json"
     deployments = read_json(deployments_file) if deployments_file.exists() else {}
+    connection_file = path.parent / ".state/ssh-connections.json"
+    connections = read_json(connection_file) if connection_file.exists() else {}
     for name, settings in data["sites"].items():
         site = Site(name=name, **settings)
         if not site.ssh:
             site.directory = str((path.parent / site.directory).resolve())
         elif manager_key(site) in deployments:
             site.manager_directory = deployments[manager_key(site)]["directory"]
-        sites[name] = site
+        site.disabled = connections.get(site.ssh, {}).get("disabled", site.disabled)
+        if include_disabled or not site.disabled:
+            sites[name] = site
     return sites
 
 
@@ -147,9 +155,11 @@ def serve(payload, *, cancel=None):
                 "inventory": inventory(p["output_root"], refresh_sizes=options.get("refresh_sizes", False),
                                        hard_refresh=options.get("hard_refresh", False), cancel=cancel),
                 "journal": Journal(p["state_dir"]).since(options.get("journal_offset", 0))}
+    if op == "install_source":
+        return install_source(p["source"], options["staging"], options["expected"])
     if op == "build":
         return build(p["source"], Path(p["executable"]).parent,
-                     native_arch=site.native_arch, **options)
+                     native_arch=site.native_arch, archive_dir=Path(site.directory).resolve() / "executables", **options)
     if op == "run":
         settings = options.pop("settings")
         if settings.keys() != DEFAULTS.keys():
@@ -191,7 +201,10 @@ def serve(payload, *, cancel=None):
 
 
 def call(site, operation, *, timeout=30, log=None, cancel=None, **options):
+    if site.disabled:
+        raise ValueError(f"Connection {site.ssh or site.name} is disabled")
     settings = asdict(site)
+    settings.pop("disabled")
     module = settings.pop("management_module")  # Client transport setting, not remote job data.
     manager_directory = settings.pop("manager_directory")
     if manager_directory:
@@ -203,16 +216,14 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, **options):
         return serve(payload, cancel=cancel)
     python = [site.python, '-u', '-m', module, '_serve']
     reader = site.ssh and operation in {"inventory", "inventory_cached", "inventory_update", "logs"}
-    if reader or manager_directory:
-        # Bound a remote reader even if its SSH connection disappears.
-        code = "import os, runpy, signal, sys; "
-        if reader:
-            code += f"signal.alarm({max(1, int(timeout))}); "
-        if manager_directory:
-            code += f"sys.path.insert(0, os.path.expanduser({manager_directory!r})); "
-        code += f"sys.argv = [{module!r}, '_serve']; runpy.run_module({module!r}, run_name='__main__')"
-        python = [site.python, '-u', '-c', code]
-    cmd = f"cd {shell_path(site.directory)} && {shlex.join(python)}"
+    if reader:
+        payload["reader_timeout"] = max(1, int(timeout))
+    if manager_directory:
+        # -P prevents a stale package in the worker directory shadowing the shared installation.
+        python.insert(2, "-P")
+    prefix = ("export PYTHONPATH=" + shell_path(manager_directory) + '${PYTHONPATH:+:"$PYTHONPATH"} && '
+              if manager_directory else "")
+    cmd = f"cd {shell_path(site.directory)} && {prefix}{shlex.join(python)}"
     if site.setup:
         cmd = site.setup + "\n" + cmd
     args = (["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
@@ -249,7 +260,8 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, **options):
         if log and stderr.strip():
             log(stderr.rstrip())
         if process.returncode:
-            raise subprocess.CalledProcessError(process.returncode, args, output=stdout, stderr=stderr)
+            raise RuntimeError(f"{site.ssh or site.name}: {operation} failed (exit {process.returncode}):\n"
+                               + (stderr.strip() or stdout.strip() or "No diagnostic output"))
     if log:
         log(f"Received {len(stdout.encode())} bytes in {time.monotonic() - started:.2f} s")
     return json.loads(stdout)
@@ -341,12 +353,6 @@ def deploy(site, *, include_source=False, local_source=None):
         # Resolve '..' before protecting the shared legacy source directory.
         if str(remote_source).rstrip("/").endswith("/simulation/MTS2D"):
             raise ValueError("Use a dedicated current-source snapshot, not ~/simulation/MTS2D")
-        quoted = shlex.quote(str(remote_source))
-        existing = subprocess.check_output(["ssh", "-T", site.ssh,
-            f"if test -e {quoted}; then cat {quoted}/SOURCE.json; else printf null; fi"], text=True)
-        previous = json.loads(existing)
-        if previous is not None and previous != source_record:
-            raise ValueError("Remote source snapshot has a different revision; choose a new source path")
     subprocess.run(["ssh", "-T", site.ssh, "mkdir -p -- " + shlex.quote(directory)], check=True)
     exclude = [".git", ".venv", "__pycache__", "*.egg-info", ".state", "output", "build*", "sites.toml"]
     args = ["rsync", "-a", "-e", "ssh -T"]
@@ -371,18 +377,15 @@ def deploy(site, *, include_source=False, local_source=None):
         subprocess.run(["rsync", "-a", "--ignore-existing", "-e", "ssh -T", str(config),
                         f"{site.ssh}:{shlex.quote(directory)}/"], check=True)
     if include_source:
-        target = f"{site.ssh}:{shlex.quote(str(remote_source))}/"
-        subprocess.run(["ssh", "-T", site.ssh, "mkdir -p -- " + shlex.quote(str(remote_source))], check=True)
-        # Copy tracked, committed files only; no stale build trees or historical outputs.
-        tracked = subprocess.check_output(["git", "-C", str(local_source), "ls-files", "-z"])
-        subprocess.run(["rsync", "-a", "--from0", "--files-from=-", "-e", "ssh -T",
-                        str(Path(local_source).resolve()) + "/", target], input=tracked, check=True)
+        staging = remote_source.parent / (".mts-source-upload-" + secrets.token_hex(8))
+        target = f"{site.ssh}:{shlex.quote(str(staging))}/"
+        subprocess.run(["ssh", "-T", site.ssh, "mkdir -p -- " + shlex.quote(str(staging))], check=True)
         with tempfile.TemporaryDirectory() as temporary:
-            record = Path(temporary) / "SOURCE.json"
-            write_json(record, source_record)
-            listing = Path(temporary) / "SOURCE_FILES.json"
-            write_json(listing, source_files(local_source))
-            subprocess.run(["rsync", "-a", "-e", "ssh -T", str(record), str(listing), target], check=True)
+            archive = Path(temporary) / "source.tar.gz"
+            if source_archive(local_source, archive) != source_record:
+                raise RuntimeError("Source changed during deployment")
+            subprocess.run(["rsync", "-a", "-e", "ssh -T", str(archive), target], check=True)
+        call(site, "install_source", staging=str(staging), expected=source_record, timeout=120)
     return {"site": site.name, "directory": directory, "source": source_record,
             "remote": call(site, "info")}
 

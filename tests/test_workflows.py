@@ -35,6 +35,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(a.config_hash, Config(rows=10, totalLoad=1.0).config_hash)
         self.assertEqual(a.folder_name("First").split("[")[1], a.folder_name("Second").split("[")[1])
 
+    def test_current_schema_and_source_archive_include_cholmod_inputs(self):
+        from MTS_Management.provenance import source_archive, verify_schema
+        import tarfile
+        source = PACKAGE_ROOT.parent / "MTS2D"
+        if not source.exists():
+            self.skipTest("Simulator source is not present")
+        verify_schema(source)
+        self.assertEqual(Config()["tangentBackend"], "cholmod")
+        self.assertNotEqual(Config().config_hash, Config(tangentBackend="eigen").config_hash)
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "source.tar.gz"
+            source_archive(source, archive)
+            with tarfile.open(archive) as snapshot:
+                self.assertIn("cmake/cholmod/CMakeLists.txt", snapshot.getnames())
+
     def test_strict_complete_roundtrip(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "config.conf"
@@ -44,7 +59,7 @@ class ConfigTests(unittest.TestCase):
             path.write_text(path.read_text().replace("seed = 0\n", ""))
             with self.assertRaises(ValueError):
                 Config.read(path)
-        for settings in ({"experiment": "simpleShear"}, {"rows": True}, {"epsR": float("nan")},
+        for settings in ({"tangentBackend": "unknown"}, {"experiment": "simpleShear"}, {"rows": True}, {"epsR": float("nan")},
                          {"totalLoad": -1}, {"loadIncrement": 0}, {"directions": "x"},
                          {"loading": "noRelaxation", "stepNoise": 1}):
             with self.assertRaises((ValueError, TypeError)):
@@ -81,6 +96,23 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual(result["updated_sites"], ["first"])
             self.assertIn("second", result["errors"])
             self.assertEqual(sites_file.read_text(), text)
+
+    def test_manager_update_retains_custom_work_storage_location(self):
+        from MTS_Management.cluster import load_sites
+        from MTS_Management.deployments import update_managers
+        from MTS_Management.provenance import scripts_identity
+        with tempfile.TemporaryDirectory() as temporary:
+            sites = Path(temporary) / "sites.toml"
+            sites.write_text('[sites.cluster]\nssh="cluster"\nmanager_directory="/work/MTS/manager"\n')
+            def verify(site, *args, **kwargs):
+                self.assertEqual(site.manager_directory, "/work/MTS/manager")
+                return {"scripts": scripts_identity()}
+            with patch("MTS_Management.deployments.subprocess.run", return_value=
+                       subprocess.CompletedProcess([], 0, "", "")), \
+                    patch("MTS_Management.deployments.call", side_effect=verify):
+                result = update_managers(sites, log=lambda _: None)
+            self.assertEqual(result["updated_sites"], ["cluster"])
+            self.assertEqual(load_sites(sites)["cluster"].manager_directory, "/work/MTS/manager")
 
 
 class WorkflowTests(unittest.TestCase):
@@ -251,10 +283,25 @@ print("finished",flush=True)
             execute(attempt)
         self.assertEqual(read_json(attempt / "status.json")["returncode"], 7)
         attempt = self.prepare(Config(seed=2))
-        self.exe.write_text(self.exe.read_text()+"\n# changed\n")
+        retained = Path(read_json(attempt / "request.json")["executable"])
+        retained.chmod(0o755)
+        retained.write_text(retained.read_text()+"\n# changed\n")
         with self.assertRaises(ValueError):
             execute(attempt)
         self.assertEqual(read_json(attempt / "status.json")["state"], "failed")
+
+    def test_prepared_job_retains_original_executable_after_working_build_replacement(self):
+        attempt = self.prepare()
+        retained = Path(read_json(attempt / "request.json")["executable"])
+        original = file_digest(self.exe)
+        self.exe.write_text("replacement build")
+        self.assertEqual(file_digest(retained), original)
+        with redirect_stdout(io.StringIO()):
+            execute(attempt)
+        self.assertEqual(read_json(attempt / "status.json")["state"], "finished")
+        from MTS_Management.provenance import build
+        with self.assertRaisesRegex(ValueError, "cannot be rebuilt"):
+            build(self.root, retained.parent)
 
     def test_changed_config_and_checkpoint(self):
         attempt = self.prepare()

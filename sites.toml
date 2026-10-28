@@ -10,94 +10,93 @@ state_dir = ".state"
 mode = "foreground"
 native_arch = true
 
-# Verified SSH alias, Python 3.12 and Slurm. Deploy this package before use.
-[sites.pascal]
-ssh = "pascal"
-management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
-directory = "~/simulation/NewSimulationScripts"
-source = "../MTS2D-current-11100d1"
-python = "python3"
-executable = "build/MTS2D"
-output_root = "/data/elundheim/MTS2D_current_output"
-state_dir = ".state"
-mode = "slurm"
-[sites.pascal.slurm]
-time = "01:00:00"
-mem = "4G"
 
-# MAGI COMPUTE: two hardware threads per physical core; compact OpenMP binding.
 [sites.magi]
 ssh = "magi"
-management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
-directory = "~/simulation/MTSManager-benchmark-magi-20261023"
-source = "../MTS2D-benchmark-magi-20261023"
+disabled = false
+directory = "~/simulation/MTS"
 python = "python3"
-executable = "build/MTS2D"
+management_module = "MTS_Management"
+manager_directory = "~/.local/share/mts/manager"
+source = "MTS2D"
+executable = "build/current/MTS2D"
 output_root = "~/MTS2D_current_output/benchmark-magi-20261023"
 state_dir = ".state"
 mode = "slurm"
-native_arch = false
-slurm_cpus_per_thread = 2
 setup = "source /etc/profile.d/modules.sh\nmodule load /softs/trixie/modules/x86-64/slurm/default"
-[sites.magi.slurm]
-time = "3-00:00:00"
-partition = "COMPUTE"
-mem = "4G"
-[sites.magi.environment]
-OMP_PLACES = "cores"
-OMP_PROC_BIND = "close"
-OMP_DYNAMIC = "FALSE"
-OMP_DISPLAY_ENV = "VERBOSE"
-OMP_DISPLAY_AFFINITY = "TRUE"
+native_arch = false
+environment = { "OMP_PLACES" = "cores", "OMP_PROC_BIND" = "close", "OMP_DYNAMIC" = "FALSE", "OMP_DISPLAY_ENV" = "VERBOSE", "OMP_DISPLAY_AFFINITY" = "TRUE" }
+slurm_cpus_per_thread = 2
+slurm = { "time" = "3-00:00:00", "partition" = "COMPUTE", "mem" = "4G" }
 
-# Verify paths and cluster setup before use.
-[sites.schwartz]
-ssh = "schwartz"
-management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
-directory = "~/simulation/NewSimulationScripts"
-source = "../MTS2D-current-11100d1"
-executable = "build/MTS2D" # Existing deployment.
-python = "python3"
-output_root = "/data2/elundheim/MTS2D_current_output"
-mode = "detached"
-
-# Verify paths and cluster setup before use.
-[sites.jeanZay]
-ssh = "jeanZay"
-management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
-directory = "~/simulation/NewSimulationScripts"
-source = "../MTS2D-current-11100d1"
-executable = "build/MTS2D" # Existing deployment.
-python = "python3" # configure the Python/compiler module environment below if needed
-output_root = "/lustre/fswork/projects/rech/bph/uog82gz/MTS2D_current_output"
-mode = "slurm"
-# setup = "module load ..."
-[sites.jeanZay.slurm]
-time = "01:00:00"
-account = "bph@cpu"
-mem = "4G"
-
-# Retained pilot deployment and completed smoke tests.
 [sites.magi-pilot]
 ssh = "magi"
-management_module = "mtscripts" # Existing deployment; leave queued jobs unchanged.
-directory = "~/simulation/MTSManager-pilot-20261022"
-source = "../MTS2D-current-bc375c7"
+disabled = false
+directory = "~/simulation/MTS"
 python = "python3"
-executable = "build/MTS2D"
+management_module = "MTS_Management"
+manager_directory = "~/.local/share/mts/manager"
+source = "MTS2D"
+executable = "/nfs/homes/elias.lundheim/simulation/MTSManager-benchmark-magi-20261023/executables/75637d038c9bd520eabfd6b5f619ead5d88cf5181fcfdf818a6487b823caa801/MTS2D"
 output_root = "~/MTS2D_current_output/pilot-20261022-bc375c7"
+state_dir = "~/simulation/MTSManager-pilot-20261022/.state"
+mode = "slurm"
+setup = "source /etc/profile.d/modules.sh\nmodule load /softs/trixie/modules/x86-64/slurm/default"
+native_arch = false
+environment = { "OMP_PLACES" = "cores", "OMP_PROC_BIND" = "close", "OMP_DYNAMIC" = "FALSE", "OMP_DISPLAY_ENV" = "VERBOSE", "OMP_DISPLAY_AFFINITY" = "TRUE" }
+slurm_cpus_per_thread = 2
+slurm = { "time" = "01:00:00", "partition" = "COMPUTE", "mem" = "4G" }
+
+[sites.pascal]
+ssh = "pascal"
+disabled = false
+directory = "~/simulation/MTS"
+python = "python3"
+management_module = "MTS_Management"
+manager_directory = "~/.local/share/mts/manager"
+source = "MTS2D"
+executable = "build/current/MTS2D"
+output_root = "/data/elundheim/MTS2D_current_output"
 state_dir = ".state"
 mode = "slurm"
+setup = ""
 native_arch = false
-slurm_cpus_per_thread = 2
-setup = "source /etc/profile.d/modules.sh\nmodule load /softs/trixie/modules/x86-64/slurm/default"
-[sites.magi-pilot.slurm]
-time = "01:00:00"
-partition = "COMPUTE"
-mem = "4G"
-[sites.magi-pilot.environment]
-OMP_PLACES = "cores"
-OMP_PROC_BIND = "close"
-OMP_DYNAMIC = "FALSE"
-OMP_DISPLAY_ENV = "VERBOSE"
-OMP_DISPLAY_AFFINITY = "TRUE"
+environment = {  }
+slurm_cpus_per_thread = 1
+slurm = { "time" = "01:00:00", "mem" = "4G" }
+
+[sites.schwartz]
+ssh = "schwartz"
+disabled = false
+directory = "~/simulation/MTS"
+python = "python3"
+management_module = "MTS_Management"
+manager_directory = "~/.local/share/mts/manager"
+source = "MTS2D"
+executable = "build/current/MTS2D"
+output_root = "/data2/elundheim/MTS2D_current_output"
+state_dir = ".state"
+mode = "detached"
+setup = ""
+native_arch = false
+environment = {  }
+slurm_cpus_per_thread = 1
+slurm = {  }
+
+[sites.jeanZay]
+ssh = "jeanZay"
+disabled = false
+directory = "~/simulation/MTS"
+python = "python3.11"
+management_module = "MTS_Management"
+manager_directory = "/lustre/fswork/projects/rech/bph/uog82gz/MTS/manager"
+source = "MTS2D"
+executable = "build/current/MTS2D"
+output_root = "/lustre/fswork/projects/rech/bph/uog82gz/MTS2D_current_output"
+state_dir = ".state"
+mode = "slurm"
+setup = ""
+native_arch = false
+environment = {  }
+slurm_cpus_per_thread = 1
+slurm = { "time" = "01:00:00", "account" = "bph@cpu", "mem" = "4G" }
