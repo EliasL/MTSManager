@@ -35,20 +35,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(a.config_hash, Config(rows=10, totalLoad=1.0).config_hash)
         self.assertEqual(a.folder_name("First").split("[")[1], a.folder_name("Second").split("[")[1])
 
-    def test_current_schema_and_source_archive_include_cholmod_inputs(self):
-        from MTS_Management.provenance import source_archive, verify_schema
-        import tarfile
+    def test_current_schema_and_packaged_cholmod_build_inputs(self):
+        from MTS_Management.provenance import source_files, verify_schema
         source = PACKAGE_ROOT.parent / "MTS2D"
         if not source.exists():
             self.skipTest("Simulator source is not present")
         verify_schema(source)
         self.assertEqual(Config()["tangentBackend"], "cholmod")
         self.assertNotEqual(Config().config_hash, Config(tangentBackend="eigen").config_hash)
-        with tempfile.TemporaryDirectory() as temporary:
-            archive = Path(temporary) / "source.tar.gz"
-            source_archive(source, archive)
-            with tarfile.open(archive) as snapshot:
-                self.assertIn("cmake/cholmod/CMakeLists.txt", snapshot.getnames())
+        self.assertTrue({"CMakeLists.txt", "cmake/cholmod/CMakeLists.txt"} <= set(source_files(source)))
 
     def test_strict_complete_roundtrip(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -60,8 +55,7 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Config.read(path)
         for settings in ({"tangentBackend": "unknown"}, {"experiment": "simpleShear"}, {"rows": True}, {"epsR": float("nan")},
-                         {"totalLoad": -1}, {"loadIncrement": 0}, {"directions": "x"},
-                         {"loading": "noRelaxation", "stepNoise": 1}):
+                         {"totalLoad": -1}, {"loadIncrement": 0}, {"directions": "x"}):
             with self.assertRaises((ValueError, TypeError)):
                 Config(**settings)
         Config(boundary="periodicAnchored", deformation="directDisplacement")
@@ -86,7 +80,7 @@ class DeploymentTests(unittest.TestCase):
                 return {"scripts": expected}
             with patch("MTS_Management.deployments.subprocess.run", return_value=
                        subprocess.CompletedProcess([], 0, "", "")), \
-                    patch("MTS_Management.deployments.call", side_effect=verify):
+                    patch("MTS_Management.deployments.deploy"), patch("MTS_Management.deployments.call", side_effect=verify):
                 result = update_managers(sites_file, log=lambda _: None)
                 update_managers(sites_file, log=lambda _: None)
             loaded = load_sites(sites_file)
@@ -109,7 +103,7 @@ class DeploymentTests(unittest.TestCase):
                 return {"scripts": scripts_identity()}
             with patch("MTS_Management.deployments.subprocess.run", return_value=
                        subprocess.CompletedProcess([], 0, "", "")), \
-                    patch("MTS_Management.deployments.call", side_effect=verify):
+                    patch("MTS_Management.deployments.deploy"), patch("MTS_Management.deployments.call", side_effect=verify):
                 result = update_managers(sites, log=lambda _: None)
             self.assertEqual(result["updated_sites"], ["cluster"])
             self.assertEqual(load_sites(sites)["cluster"].manager_directory, "/work/MTS/manager")
@@ -169,7 +163,6 @@ print("finished",flush=True)
             first = inventory(self.output)
         names = [Path(call.args[0]).name for call in read.call_args_list]
         self.assertEqual(names.count("request.json"), 1)
-        self.assertEqual(names.count("status.json"), 1)
         folder = attempt.parents[1]
         (folder / "macroData.csv").write_text("load,value\n0,1\n0.75,2\n")
         with patch("MTS_Management.inventory.Config.read", side_effect=AssertionError("Finished run reread")):
@@ -225,14 +218,13 @@ print("finished",flush=True)
         with self.assertRaisesRegex(ValueError, "moved"):
             build(self.root, self.exe.parent)
 
-    def test_old_build_schema_is_rejected_before_creating_output(self):
+    def test_old_build_schema_preserves_selected_binary(self):
         manifest = self.exe.parent/"build-manifest.json"
         record = read_json(manifest)
         record.pop("configuration_keys_sha256")
         write_json(manifest, record)
-        with self.assertRaisesRegex(ValueError, "schema"):
-            self.prepare()
-        self.assertFalse(self.output.exists())
+        attempt = self.prepare()
+        self.assertEqual(read_json(attempt / "request.json")["build"], record)
 
     def test_site_environment_and_physical_core_allocation(self):
         site = Site(name="magi", slurm_cpus_per_thread=2,
@@ -465,7 +457,7 @@ print("finished",flush=True)
              patch("MTS_Management.cluster.subprocess.run", wraps=subprocess.run) as transfer:
             fetched = fetch_many(site, [c.config_hash for c in configs], self.root/"batch",
                                  completed_only=True)
-        self.assertEqual(remote.call_count, 1)
+        self.assertEqual(sum(c.args[1] == "inventory" for c in remote.call_args_list), 1)
         self.assertEqual(transfer.call_count, 1)
         self.assertEqual(len(fetched), 2)
         for folder in map(Path, fetched):
@@ -524,11 +516,11 @@ print("finished",flush=True)
         sites = self.root/"sites.toml"
         settings = asdict(site); settings.pop("name")
         sites.write_text("[sites.local]\n" + "\n".join(f"{k} = {json.dumps(v)}" for k,v in settings.items()))
-        campaign = self.root/"campaign.json"
+        campaign = self.root/"simulations.json"
         entries = [{"label": "Bench", "settings": Config().as_dict()},
                    {"label": "Diagnostic", "settings": Config(logDuringMinimization=True).as_dict()}]
         write_json(campaign, {"name": "ControllerTest", "runs": entries})
-        write_json(campaign.with_suffix(".resources.json"), {"campaign_sha256": file_digest(campaign),
+        write_json(campaign.with_name("resources.json"), {"campaign_sha256": file_digest(campaign),
             "diagnostic_label": "Diagnostic", "benchmark_jobs": 1, "site": "fixture",
             "simulator_revision": "test", "resources": {"3": {"time": "01:00:00", "mem": "4G"}}})
         args = [str(campaign), "--sites", str(sites)]

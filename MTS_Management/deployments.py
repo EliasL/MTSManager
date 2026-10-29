@@ -5,7 +5,7 @@ from pathlib import Path
 import shlex
 import subprocess
 
-from .cluster import call, load_sites, manager_key, shell_path
+from .cluster import call, load_sites, manager_key, shell_path, deploy
 from .files import locked, read_json, write_json
 from .provenance import scripts_identity
 from .runner import PACKAGE_ROOT
@@ -54,10 +54,14 @@ def update_managers(site_file, *, log=print, host=None):
             continue
         for site in profiles:
             try:
+                run(["rsync", "-a", "-e", "ssh -T", str(PACKAGE_ROOT / "campaigns") + "/",
+                     host + ":" + directory + "/campaigns/"])
+
                 run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", site.ssh,
                      "umask 077; mkdir -p -- " + shell_path(site.directory)])
                 candidate = replace(site, manager_directory=directory)
                 info = call(candidate, "info", timeout=30, log=log)
+                deploy(candidate, include_source=True, local_source=PACKAGE_ROOT.parent / "MTS2D")
                 if info["scripts"] != expected:
                     raise ValueError("Deployed manager does not match the local source version")
                 with locked(registry_file.with_suffix(".lock")):

@@ -1,7 +1,7 @@
 # MTS2D execution pilot on MAGI, October 2026
 
 This small campaign checks simulation execution and CPU affinity on the MAGI
-computing cluster before running larger performance studies. `campaign.json`
+computing cluster before running larger performance studies. `simulations.json`
 contains eight configurations at square size 50, varying 1/2 threads,
 none/exactTangent preconditioning and none/edgeFlip reconnection with seed 0.
 

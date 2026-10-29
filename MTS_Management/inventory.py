@@ -10,9 +10,14 @@ import shutil
 import time
 
 from .config import Config
+
 from .files import file_digest, locked, now, read_json, write_json
 from .inventory_cache import invalidate, publish, records
-from .runner import process_token
+from .runner import process_token, attempt_status
+
+
+def config_metadata_stamp():
+    return [[str(p), p.stat().st_mtime_ns] for p in sorted((Path(__file__).parent.parent / "campaigns").rglob("metadata.json"))]
 
 
 def progress(folder, config, limit=65536):
@@ -138,7 +143,8 @@ def _inventory(root, *, config_hash, refresh_sizes, hard_refresh, cancel):
         revision, row = cached.get(h, (0, None))
         revisions[h] = revision
         if (not hard_refresh and not refresh_sizes and row is not None and row["folder"] == str(folder)
-                and row["status"]["state"] == "finished" and not row["queued_continuations"]):
+                and row["status"]["state"] == "finished" and not row["queued_continuations"]
+                and row.get("settings_metadata") == config_metadata_stamp()):
             result.append(row)
             continue
         config = Config.read(folder / "config.conf", expected_name=folder.name)
@@ -146,19 +152,21 @@ def _inventory(root, *, config_hash, refresh_sizes, hard_refresh, cancel):
             raise ValueError(f"Index/config mismatch: {folder}")
         requests = {attempt: read_json(attempt / "request.json") for attempt in (folder / "attempts").iterdir()}
         attempts = sorted(requests, key=lambda p: requests[p]["created_at"])
-        statuses = {a: read_json(a / "status.json") for a in attempts}
+        statuses = {a: attempt_status(a) for a in attempts}
         active = [a for a in attempts if statuses[a]["state"] in {"running", "stopping"}]
         queued = [a for a in attempts if statuses[a]["state"] in {"prepared", "queued"}]
         attempt = (active[-1] if active else queued[0] if queued else attempts[-1]) if attempts else None
         request = requests[attempt] if attempt else {}
         status = statuses[attempt] if attempt else {"state": "unknown"}
-        if status["state"] == "running" and "scheduler_id" not in status:
+        if status["state"] == "running" and "scheduler_id" not in status and "pid" in status:
             status["process_alive"] = bool(status.get("process_token")) and (
                 process_token(status["pid"]) == status["process_token"])
         cache = folder / ".size-estimate.json"
         if refresh_sizes:
             write_json(cache, estimate_size(folder))
         row = {"config_hash": h, "folder": str(folder), "attempt": str(attempt) if attempt else None,
+                       "settings_metadata": config_metadata_stamp(),
+                       "executable": request.get("executable"), "build": request.get("build"),
                        "manifest_sha256": file_digest(folder / "manifest.json"),
                        "campaign": request.get("campaign"), "status": status,
                        "queued_continuations": len([a for a in queued if a != attempt]),

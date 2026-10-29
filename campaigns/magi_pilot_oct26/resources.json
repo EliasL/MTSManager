@@ -1,0 +1,9 @@
+{
+  "site": "magi-pilot",
+  "resources": {
+    "50": {
+      "mem": "4G",
+      "time": "01:00:00"
+    }
+  }
+}

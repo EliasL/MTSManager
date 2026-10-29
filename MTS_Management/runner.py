@@ -46,10 +46,50 @@ def cpu_allocation():
             "physical_cores": len(cores)}
 
 
+def attempt_status(attempt):
+    """Read both historical worker records and direct process/scheduler evidence."""
+    attempt = Path(attempt)
+    status = read_json(attempt / "status.json")
+    request = read_json(attempt / "request.json")
+    if not request.get("command"):
+        return status
+    exitfile = attempt / "exitcode"
+    if exitfile.exists():
+        code = int(exitfile.read_text())
+        return status | {"state": "finished" if code == 0 else "failed", "returncode": code}
+    if status.get("scheduler_id"):
+        result = subprocess.run(["sacct", "-X", "-n", "-P", "-j", status["scheduler_id"],
+                                 "--format=JobIDRaw,State,ExitCode"], capture_output=True, text=True, check=True)
+        for line in result.stdout.splitlines():
+            fields = line.split("|")
+            if fields[0] == status["scheduler_id"]:
+                state = fields[1].split()[0].rstrip("+")
+                mapped = {"COMPLETED": "finished", "RUNNING": "running", "PENDING": "queued",
+                          "CANCELLED": "stopped", "TIMEOUT": "stopped", "PREEMPTED": "stopped",
+                          "COMPLETING": "running", "CONFIGURING": "queued", "SUSPENDED": "running",
+                          "REQUEUED": "queued"}
+                return status | {"state": mapped.get(state, "failed"), "scheduler_state": state}
+    elif status.get("launcher_pid"):
+        alive = process_token(status["launcher_pid"]) == status.get("launcher_token")
+        return status | {"state": "running" if alive else ("stopped" if status["state"] == "stopped" else "unknown"), "process_alive": alive}
+    return status
+
+
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
             checkpoint=None, site="local", environment=None, after=None):
+    if checkpoint:
+        root = Path(output_root).resolve()
+        index_path = root / ".run-index.json"
+        index = read_json(index_path) if index_path.exists() else {}
+        if config.config_hash in index:
+            prior = root / index[config.config_hash] / "attempts"
+            requests = [read_json(p / "request.json") for p in prior.iterdir()]
+            if requests:
+                executable = max(requests, key=lambda r: r["created_at"])["executable"]
     executable = retain_executable(executable, Path(state_dir).resolve().parent / "executables")
     build = executable_identity(executable)
+    from .campaign import record_executable
+    record_executable(campaign, site, executable)
     output_root = Path(output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     resume_latest = checkpoint == "latest"
@@ -82,7 +122,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             old = read_json(manifest_path)
             if any(old[k] != v for k, v in identity.items()):
                 raise ValueError("Output belongs to different settings/executable; use another output root")
-            previous_statuses = [read_json(a / "status.json") for a in (folder / "attempts").iterdir()]
+            previous_statuses = [attempt_status(a) for a in (folder / "attempts").iterdir()]
             for status in previous_statuses:
                 if status["state"] in ACTIVE and not after:
                     raise RuntimeError(f"An active attempt already exists in {folder / 'attempts'}")
@@ -117,6 +157,13 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                    "resume_latest": resume_latest, "predecessor": str(after) if after else None,
                    "environment": dict(environment or {}),
                    "created_at": now()}
+        if build.get("execution_interface") == "folder-v1":
+            command = [str(executable), str(folder), "--resume"]
+            if inputs:
+                command = [str(executable), "-c", str(folder / "config.conf"),
+                           "-o", str(folder.parent), "-d", inputs["checkpoint"]]
+            request.update(command=command, cwd=str(folder),
+                           environment=dict(environment or {}) | {"OMP_NUM_THREADS": str(config["nrThreads"])})
         write_json(attempt / "request.json", request)
         write_json(attempt / "status.json", {"state": "prepared", "updated_at": now()})
         index[config.config_hash] = folder.name
@@ -147,14 +194,34 @@ def launch(attempt, *, mode="foreground", slurm=None, setup=""):
     attempt = Path(attempt).resolve()
     request = read_json(attempt / "request.json")
     result_fields = {"attempt": str(attempt), "attempt_id": request["attempt_id"],
-                     "output_folder": request["output_folder"]}
+                     "output_folder": request["output_folder"],
+                     "executable": request["executable"], "build": request["build"]}
     cmd = python_command("_execute", attempt)
+    if request.get("command"):
+        script = attempt / "submit.sh"
+        text = "#!/bin/bash\nset -euo pipefail\n" + setup + "\n"
+        text += "cd " + shlex.quote(request["cwd"]) + "\n"
+        text += "".join("export " + k + "=" + shlex.quote(v) + "\n" for k, v in request["environment"].items())
+        command = shlex.join(request["command"])
+        if mode == "slurm":
+            text += "exec " + command + "\n"
+        else:
+            temporary = shlex.quote(str(attempt / "exitcode.tmp"))
+            destination = shlex.quote(str(attempt / "exitcode"))
+            text += ("set +e\n" + command + "\ncode=$?\nprintf '%s\\n' \"$code\" > "
+                     + temporary + "\nmv " + temporary + " " + destination + "\nexit \"$code\"\n")
+        script.write_text(text)
+        cmd = ["bash", str(script)]
     try:
         if mode == "foreground":
-            execute(attempt)
+            if request.get("command"):
+                with (attempt / "stdout.log").open("ab") as log:
+                    subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
+            else:
+                execute(attempt)
             return result_fields | {"state": "finished"}
         if mode == "detached":
-            with (attempt / "launcher.log").open("ab") as log:
+            with (attempt / ("stdout.log" if request.get("command") else "launcher.log")).open("ab") as log:
                 process = subprocess.Popen(cmd, cwd=PACKAGE_ROOT, stdout=log, stderr=subprocess.STDOUT,
                                            stdin=subprocess.DEVNULL, start_new_session=True)
             # Reap it if this caller stays alive; detachment still survives caller exit.
@@ -175,14 +242,15 @@ def launch(attempt, *, mode="foreground", slurm=None, setup=""):
         if int(slurm.get("cpus-per-task", threads)) < threads:
             raise ValueError("Slurm CPU allocation is smaller than nrThreads")
         args = ["sbatch", "--parsable", f"--job-name={Path(request['output_folder']).name}",
-                f"--output={attempt / 'launcher.log'}", "--nodes=1", "--ntasks=1"]
+                f"--output={attempt / ('stdout.log' if request.get('command') else 'launcher.log')}", "--nodes=1", "--ntasks=1"]
         if request.get("predecessor"):
             predecessor = read_json(Path(request["predecessor"]) / "status.json")["scheduler_id"]
             args += [f"--dependency=afterany:{predecessor}"]
         args += [f"--{k}={v}" for k, v in ({"cpus-per-task": threads} | slurm).items()]
         script = attempt / "submit.sh"
-        script.write_text("#!/bin/bash\nset -euo pipefail\n" + setup + "\ncd " +
-                          shlex.quote(str(PACKAGE_ROOT)) + "\nexec " + shlex.join(cmd) + "\n")
+        if not request.get("command"):
+            script.write_text("#!/bin/bash\nset -euo pipefail\n" + setup + "\ncd " +
+                              shlex.quote(str(PACKAGE_ROOT)) + "\nexec " + shlex.join(cmd) + "\n")
         # Mark pending before sbatch: a fast scheduler may start the worker immediately.
         set_status(attempt, "queued", slurm={"cpus-per-task": threads} | slurm,
                    predecessor=request.get("predecessor"))
@@ -206,6 +274,8 @@ def execute(attempt):
     attempt = Path(attempt).resolve()
     request = read_json(attempt / "request.json")
     folder = Path(request["output_folder"])
+    if request.get("command"):
+        raise ValueError("Direct attempts run their saved submit.sh, not _execute")
     with locked(folder / ".run.lock", blocking=False):
         if read_json(attempt / "status.json")["state"] not in {"prepared", "queued"}:
             raise RuntimeError("Attempt has already executed or was cancelled")
@@ -323,7 +393,7 @@ def run(config, *, mode="foreground", slurm=None, **options):
 def stop(attempt):
     attempt = Path(attempt).resolve()
     with locked(attempt / ".status.lock"):
-        status = read_json(attempt / "status.json")
+        status = attempt_status(attempt)
         state = "stopped"
         if status["state"] not in ACTIVE:
             raise ValueError(f"Attempt is already {status['state']}")
@@ -342,6 +412,9 @@ def stop(attempt):
                 if observed not in terminal:
                     raise RuntimeError(f"Cannot cancel/confirm job state: {cancelled.stderr}")
                 status["scheduler_terminal_state"] = observed
+        elif read_json(attempt / "request.json").get("command"):
+            if status.get("launcher_pid") and process_token(status["launcher_pid"]) == status.get("launcher_token"):
+                os.killpg(status["launcher_pid"], signal.SIGTERM)
         elif status["state"] == "running":
             if (not status.get("runner_token") or
                     process_token(status["runner_pid"]) != status["runner_token"]):
@@ -380,7 +453,12 @@ def run_many(attempts, workers=2):
             if cancelled.is_set():
                 set_status(attempt, "stopped", reason="Batch interrupted")
                 return
-            process = subprocess.Popen(python_command("_execute", attempt), cwd=PACKAGE_ROOT,
+            request = read_json(Path(attempt) / "request.json")
+            if request.get("command"):
+                launch(attempt, mode="foreground")
+                return
+            command = python_command("_execute", attempt)
+            process = subprocess.Popen(command, cwd=PACKAGE_ROOT,
                                        start_new_session=True)
             processes.append(process)
         code = process.wait()

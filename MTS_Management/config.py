@@ -62,14 +62,10 @@ class Config:
             raise ValueError("Multiple/repeated directions require positive segmentLoad")
         if v["deformation"] == "directDisplacement" and v["boundary"] == "periodic":
             raise ValueError("directDisplacement requires driven fixed/anchored nodes")
-        if v["startLoad"] < 0 or not math.isfinite(v["startLoad"] + v["totalLoad"]):
+        if not math.isfinite(v["startLoad"] + v["totalLoad"]):
             raise ValueError("Invalid startLoad/totalLoad")
         if v["totalLoad"] > 0 and v["startLoad"] + v["totalLoad"] <= v["startLoad"]:
             raise ValueError("totalLoad is too small to advance startLoad")
-        if v["stepNoise"] and v["loading"] != "relaxation":
-            raise ValueError("stepNoise requires relaxation")
-        if v["loading"] == "noRelaxation" and v["deformation"] == "simpleShear" and not v["affineInitialGuess"]:
-            raise ValueError("noRelaxation shear requires affineInitialGuess")
         if v["reversibilityTolerance"] <= 0 or v["energyDropThreshold"] < 0:
             raise ValueError("Invalid reversibilityTolerance/energyDropThreshold")
         if any(v[k] < 0 for k in ("stopAfterSteps", "stopAfterPlasticSteps",
@@ -94,7 +90,7 @@ class Config:
         return self._values[key]
 
     def as_dict(self):
-        return dict(self._values)
+        return dict(getattr(self, "_original", self._values))
 
     @property
     def config_hash(self):
@@ -114,14 +110,29 @@ class Config:
         def render(value):
             return str(value).lower() if isinstance(value, bool) else str(value)
         return "\n".join([f"name = {name}"] +
-                         [f"{k} = {render(v)}" for k, v in sorted(self._values.items())]) + "\n"
+                         [f"{k} = {render(v)}" for k, v in sorted(self.as_dict().items())]) + "\n"
 
     def write(self, path, label=None):
         Path(path).write_text(self.text(self.folder_name(label)))
 
     @classmethod
+    def saved(cls, values, supplement=None):
+        """Resolve absent campaign settings without changing the saved identity."""
+        missing = DEFAULTS.keys() - values.keys()
+        if supplement is None:
+            supplement = {}
+        if missing and not supplement:
+            from .campaign import supplemental_settings
+            supplement = supplemental_settings(values)
+        if missing - supplement.keys() or values.keys() - DEFAULTS.keys():
+            raise ValueError(f"Incomplete/unknown settings: {sorted((missing - supplement.keys()) | (values.keys() - DEFAULTS.keys()))}")
+        result = cls(**(supplement | values))
+        result._original = {k: result[k] for k in values}
+        return result
+
+    @classmethod
     def read(cls, path, *, expected_name=None):
-        """Only complete new-format files are accepted; never fill missing settings."""
+        """Read original settings, resolving omissions through campaign metadata."""
         values = {}
         for line in Path(path).read_text().splitlines():
             line = line.split("#", 1)[0].strip()
@@ -132,16 +143,17 @@ class Config:
                 raise ValueError(f"Duplicate setting: {key}")
             values[key] = value
         name = values.pop("name")
-        if values.keys() != DEFAULTS.keys():
-            raise ValueError(f"Incomplete/unknown settings: {sorted(values.keys() ^ DEFAULTS.keys())}")
-        for key, default in DEFAULTS.items():
+        for key in values:
+            if key not in DEFAULTS:
+                raise ValueError(f"Unknown setting: {key}")
+            default = DEFAULTS[key]
             if type(default) is bool:
                 if values[key] not in ("true", "false"):
                     raise ValueError(f"{key} must be true or false")
                 values[key] = values[key] == "true"
             else:
                 values[key] = type(default)(values[key])
-        result = cls(**values)
+        result = cls.saved(values)
         if name != result.folder_name(name.split("[")[0]):
             raise ValueError("Configuration name/hash mismatch")
         if expected_name is not None and name != expected_name:

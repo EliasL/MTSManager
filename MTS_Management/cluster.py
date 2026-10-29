@@ -20,7 +20,7 @@ from .files import canonical, digest, file_digest, locked, now, read_json, write
 from .inventory import inventory, rebuild_index, resources
 from .inventory_cache import export as export_inventory, snapshot as cached_inventory
 from .journal import Journal
-from .provenance import build, install_source, source_archive, source_files, source_identity
+from .provenance import build, install_source, source_archive, source_files, source_identity, executable_identity
 from .runner import PACKAGE_ROOT, launch, prepare, stop
 
 
@@ -148,6 +148,13 @@ def serve(payload, *, cancel=None):
     if op == "resources":
         return resources(p["output_root"]) | {
             "scheduler": scheduler_jobs() if site.mode == "slurm" else None}
+    if op == "install_campaign_files":
+        from .campaign import install_campaign_files
+        install_campaign_files(options["records"])
+        return {"installed": len(options["records"])}
+    if op == "campaign_files":
+        from .campaign import campaign_files
+        return campaign_files(options["names"])
     if op == "journal":
         return Journal(p["state_dir"]).since(**options)
     if op == "snapshot":
@@ -162,9 +169,7 @@ def serve(payload, *, cancel=None):
                      native_arch=site.native_arch, archive_dir=Path(site.directory).resolve() / "executables", **options)
     if op == "run":
         settings = options.pop("settings")
-        if settings.keys() != DEFAULTS.keys():
-            raise ValueError("Remote run requests require complete settings")
-        config = Config(**settings)
+        config = Config.saved(settings)
         chain = options.pop("chain", 1)
         # Remote sessions must survive loss of the SSH connection.
         mode = "detached" if site.mode == "foreground" else site.mode
@@ -320,9 +325,32 @@ def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=
         raise
     journal.append("submission_accepted", submission_id=submission["event_id"],
                    site=site.name, config_hash=config.config_hash, campaign=campaign, **result)
+    for job in result.get("jobs", [result]):
+        if job.get("executable"):
+            archive_binary(site, job, campaign, state_dir)
     # Execution events arriving later are imported by sync-log (and status jobs).
     sync_journals([site], state_dir)
     return result
+
+
+def archive_binary(site, job, campaign, state_dir):
+    """Use the ordinary retained-build store for execution and archival copies."""
+    from .provenance import retain_executable
+    from .campaign import record_executable
+    archive = Path(state_dir).resolve().parent / "executables"
+    destination = archive / digest(job["build"])
+    if not (destination / "MTS2D").exists():
+        with tempfile.TemporaryDirectory() as temporary:
+            origin = str(Path(job["executable"]).parent) + "/"
+            if site.ssh:
+                origin = site.ssh + ":" + shlex.quote(origin)
+            subprocess.run(["rsync", "-a", "-e", "ssh -T", "--include=MTS2D",
+                            "--include=build-manifest.json", "--exclude=*", origin, temporary + "/"], check=True)
+            retain_executable(Path(temporary) / "MTS2D", archive)
+    if executable_identity(destination / "MTS2D") != job["build"]:
+        raise ValueError("Local retained build differs from the execution record")
+    record_executable(campaign, site.name, job["executable"], job["build"]["executable_sha256"])
+    record_executable(campaign, "local", destination / "MTS2D")
 
 
 def deploy(site, *, include_source=False, local_source=None):
@@ -354,7 +382,7 @@ def deploy(site, *, include_source=False, local_source=None):
         if str(remote_source).rstrip("/").endswith("/simulation/MTS2D"):
             raise ValueError("Use a dedicated current-source snapshot, not ~/simulation/MTS2D")
     subprocess.run(["ssh", "-T", site.ssh, "mkdir -p -- " + shlex.quote(directory)], check=True)
-    exclude = [".git", ".venv", "__pycache__", "*.egg-info", ".state", "output", "build*", "sites.toml"]
+    exclude = [".git", ".venv", "__pycache__", "*.egg-info", ".state", "output", "build*", "executables", "sites.toml"]
     args = ["rsync", "-a", "-e", "ssh -T"]
     for item in exclude:
         args += ["--exclude", item]
@@ -422,6 +450,10 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     rows = sorted(selected.values(), key=lambda r: r["config_hash"])
     if not rows:
         return []
+    from .campaign import install_campaign_files
+    names = sorted({r["campaign"] for r in rows if r.get("campaign") not in (None, "AdHoc", "GUI")})
+    if names:
+        install_campaign_files(call(site, "campaign_files", names=names))
     roots = {Path(r["folder"]).parent for r in rows}
     if len(roots) != 1:
         raise ValueError("Batch fetch requires runs in one output root")
@@ -449,6 +481,8 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
         subprocess.run(["rsync", "-ar", "-e", "ssh -T", "--files-from=" + str(listing),
                         *filters, origin, str(destination) + "/"], check=True)
     for row in rows:
+        if site.ssh and row.get("executable") and row.get("build"):
+            archive_binary(site, row, row.get("campaign"), PACKAGE_ROOT / ".state")
         target = destination / Path(row["folder"]).name
         if file_digest(target / "manifest.json") != row["manifest_sha256"]:
             raise ValueError(f"Transferred manifest differs from inventory: {target}")

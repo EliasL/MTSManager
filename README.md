@@ -57,10 +57,10 @@ For example, create a size-and-seed sweep:
 mkdir -p campaigns/size_scaling_oct26
 mts config campaigns/size_scaling_oct26/base.conf --label Example \
   --set rows=10 --set cols=10 --set boundary=periodic --set totalLoad=0.01
-mts make-campaign campaigns/size_scaling_oct26/campaign.json --name SizeScaling \
+mts make-campaign campaigns/size_scaling_oct26/simulations.json --name SizeScaling \
   --base campaigns/size_scaling_oct26/base.conf \
   --vary 'L=[10,20,40]' --vary 'seed=[0,1,2]'
-mts campaign campaigns/size_scaling_oct26/campaign.json --site local --workers 2
+mts campaign campaigns/size_scaling_oct26/simulations.json --site local --workers 2
 ```
 
 `L` sets both `rows` and `cols`. `--workers` limits simultaneous local runs;
@@ -136,23 +136,18 @@ Use it after changes made outside MTSManager. Directory-size estimation remains
 a separate `--refresh-sizes` option. These commands require the updated manager
 on the execution host.
 
-The desktop application's Update all server managers action deploys the installed
-local package into the shared `~/.local/share/mts/manager/` installation on each
-SSH destination. Repeated updates replace this installation, including obsolete
-package files. The package identity is verified before recording a profile's
-location in `.state/manager-deployments.json`; `load_sites` applies these locations
-to subsequent calls. Updates leave other manager directories, simulator builds
-and simulation data untouched.
+The desktop application's Update MTS on servers action transfers the manager,
+campaign directories and verified simulator source. The shared package identity
+is checked before recording profile locations in `.state/manager-deployments.json`.
+Source compilation remains separate. Retained binaries and scientific output
+are preserved.
 
-Job requests record the manager identity at submission. Execution records its
-manager identity as `execution_scripts` in the attempt status and running event.
-The identities may differ: manager updates do not invalidate submitted jobs.
-Executable, configuration and checkpoint identity checks remain enforced.
-Manager changes must remain compatible with saved job requests. Existing
-submission scripts retain their recorded working directory.
-
-Execution history is stored in `.state/job-log.jsonl`. Keep it and run manifests
-with your results; they record requests, starts, outcomes and execution identities.
+Submission records and `.state/job-log.jsonl` identify requests, accepted jobs
+and administrative actions. Each attempt saves the original command, environment
+and script. Direct jobs use those files without importing the manager at runtime.
+Scheduler/process records, attempt logs and scientific termination summaries
+provide execution outcomes. The October 2026 benchmark retains its historical
+worker commands and installation.
 
 ## Remote execution
 
@@ -190,12 +185,12 @@ Retained copies are stored under `executables/<build-identity>/MTS2D` and cannot
 be rebuilt in place. Set a profile's `executable` to a retained path to select an
 older compiled version; checkpoint and configuration checks still apply.
 
-Retention applies when each run is submitted. A campaign name does not pin a
-binary for future submissions: select a retained executable in the site's
-profile to use one build throughout a campaign. Queued jobs keep their recorded
-binary after working builds change. The manager itself is not retained per job;
-updating it can affect queued workers, whose submission and execution manager
-identities are recorded separately.
+Retention applies when each run is submitted. Folder-interface builds execute
+through a saved shell command pointing directly to the retained binary and run
+folder. MTS2D owns checkpoint selection and the run lock. Older saved worker
+commands remain supported for the October 2026 benchmark. Resume preparation
+uses the binary recorded for that run, even if the site's working build changes.
+Campaign `metadata.json` records binary paths and local archival copies.
 
 Builds are compiled on the execution host; local binaries and CMake caches are
 not uploaded. The supplied remote profiles describe specific installations and
@@ -204,7 +199,7 @@ new deployments use `MTS_Management`.
 Configurations explicitly record `tangentBackend`; the current default is
 `cholmod`, with `eigen` available in CHOLMOD-enabled builds. Configuration identity
 includes this choice. Saved campaign plans retain their recorded identities for
-monitoring; new submissions require the current complete configuration schema.
+monitoring; absent settings in existing runs are interpreted using campaign metadata without changing their hashes.
 
 After configuring a site:
 
@@ -215,8 +210,8 @@ mts run examples/smoke.conf --site cluster --campaign Smoke
 mts status jobs --site cluster --watch
 ```
 
-Use dedicated deployment and source directories. Keep the deployed manager,
-configuration and executable fixed while jobs are queued or running. Queued and
+Use dedicated deployment and source directories. Keep the
+configuration and retained executable available while jobs are queued or running. Queued and
 detached jobs continue after the client disconnects. Scheduler state and worker
 state are shown separately; a missing worker is not reported as a successful run.
 
@@ -232,10 +227,10 @@ mts run original.conf --site cluster --checkpoint latest
 ```
 
 Continuation requires the original configuration and executable and a checkpoint
-inside the managed run folder. `latest` selects the newest dump at worker startup.
+inside the managed run folder. `latest` requests simulator-owned checkpoint discovery for folder-interface builds; historical benchmark workers retain their recorded selection path.
 To queue several sequential Slurm allocations, use `--chain N`; this requires
 `writeDumps=true`. Periodic `checkpointInterval` saves limit work lost to timeouts.
-Missing checkpoints and cancelled predecessors raise errors rather than restarting
+Missing checkpoints for existing progress raise errors rather than restarting
 from scratch.
 
 Use `mts sync-log --site cluster` to merge remote history locally and `mts history`
@@ -280,3 +275,12 @@ The suite covers run identity, execution history, process control, scheduler
 continuation and data integrity. Small real-simulator checks run when the isolated
 `../MTS2D/build/release/MTS2D` executable is available. Scheduler tests do not
 submit cluster jobs.
+
+
+Campaign directories contain `simulations.json` (original labelled settings),
+`resources.json` (submission resources) and editable `metadata.json` (missing
+settings and binary references). Supplements fill only absent keys. They do not
+change the original configuration or its hash. Update MTS on servers transfers
+manager code, campaign files and a verified MTS2D source snapshot; compilation
+is a separate operation. Scientific output and retained binaries are preserved.
+Each attempt saves its exact command, environment and script under `attempts/`.

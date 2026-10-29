@@ -220,6 +220,7 @@ def _build(source, build_dir, *, jobs=2, native_arch=False, archive_dir=None):
                               cache, re.MULTILINE))
     record = identity | {"executable": str(executable), "executable_sha256": file_digest(executable),
                          "configuration_keys_sha256": digest(sorted(DEFAULTS)),
+                         "execution_interface": "folder-v1",
                          "built_at": now(), "build_type": "Release", "build_options": options,
                          "cmake_cache_sha256": file_digest(build_dir / "CMakeCache.txt")}
     write_json(build_dir / "build-manifest.json", record)
@@ -236,7 +237,4 @@ def _verified_build(executable):
 
 
 def executable_identity(executable):
-    record = _verified_build(executable)
-    if record.get("configuration_keys_sha256") != digest(sorted(DEFAULTS)):
-        raise ValueError("Executable configuration schema differs; rebuild with the current package")
-    return record
+    return _verified_build(executable)

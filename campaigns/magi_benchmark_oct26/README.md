@@ -18,8 +18,8 @@ checkpoints are disabled for the timing runs.
 
 ## Files
 
-- `campaign.json`: full simulation configurations and labels.
-- `campaign.resources.json`: campaign checksum, simulator revision and resource requests.
+- `simulations.json`: full simulation configurations and labels.
+- `resources.json`: campaign checksum, simulator revision and resource requests.
 - `base.conf`: base simulation settings.
 - `launch.py`: submission controller with persistent receipts for interrupted submissions.
 
@@ -33,7 +33,7 @@ From MTSManager/, validate the configuration and resource plan without submittin
 
 ```sh
 python -m campaigns.magi_benchmark_oct26.launch \
-  campaigns/magi_benchmark_oct26/campaign.json --dry-run
+  campaigns/magi_benchmark_oct26/simulations.json --dry-run
 ```
 
 To submit, use a dedicated cluster deployment with the specified simulator build
@@ -41,7 +41,7 @@ and a configured native Slurm profile. From that deployment's MTSManager directo
 
 ```sh
 python -u -m campaigns.magi_benchmark_oct26.launch \
-  campaigns/magi_benchmark_oct26/campaign.json --site local
+  campaigns/magi_benchmark_oct26/simulations.json --site local
 ```
 
 Submission receipts are stored under `.state/MAGI-Benchmark-20261023/`. After an

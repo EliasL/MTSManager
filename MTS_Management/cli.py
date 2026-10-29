@@ -141,6 +141,10 @@ def main(argv=None):
         for c, entry in zip(configs, entries):
             c.folder_name(entry["label"])
         write_json(args.path, {"name": args.name, "runs": entries})
+        for name in ("resources.json", "metadata.json"):
+            companion = args.path.with_name(name)
+            if not companion.exists():
+                write_json(companion, {"missing_settings": {}, "executables": []} if name == "metadata.json" else {})
         print(f"Wrote {len(entries)} configurations to {args.path}")
         return
     sites = load_sites(args.sites)
@@ -172,6 +176,17 @@ def main(argv=None):
             site = replace(site, mode=args.mode)
         if args.chain < 1 or (args.chain > 1 and site.mode != "slurm"):
             raise ValueError("--chain requires a positive count and Slurm for multiple jobs")
+        resource_plan = {}
+        if args.command == "campaign":
+            from .campaign import install_campaign_files
+            records = {p.name: read_json(p) for p in
+                       (args.path, args.path.with_name("resources.json"), args.path.with_name("metadata.json"))
+                       if p.exists()}
+            records["simulations.json"] = records.pop(args.path.name)
+            install_campaign_files([records])
+            resource_plan = records.get("resources.json", {}).get("resources", {})
+            if site.ssh:
+                call(site, "install_campaign_files", records=[records])
         campaign, entries = ((args.campaign, [(Config.read(args.path), args.label)])
                              if args.command == "run" else campaign_entries(args.path))
         if not site.ssh and site.mode == "foreground":
@@ -194,7 +209,7 @@ def main(argv=None):
                 run_many(attempts, args.workers)
                 result = {"attempts": list(map(str, attempts))}
         else:
-            result = [submit(site, config, state_dir=state_dir, campaign=campaign, label=label,
+            result = [submit(replace(site, slurm=site.slurm | resource_plan.get(str(config["rows"]), {})), config, state_dir=state_dir, campaign=campaign, label=label,
                              checkpoint=args.checkpoint if args.command == "run" else None,
                              chain=args.chain)
                       for config, label in entries]

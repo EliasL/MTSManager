@@ -22,7 +22,7 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     name, entries = campaign_entries(args.campaign)
-    plan = read_json(args.campaign.with_suffix(".resources.json"))
+    plan = read_json(args.campaign.with_name("resources.json"))
     if file_digest(args.campaign) != plan["campaign_sha256"]:
         raise ValueError("Campaign differs from its recorded resource plan")
     diagnostics = [label for config, label in entries if config["logDuringMinimization"]]
@@ -39,6 +39,16 @@ def main(argv=None):
         raise ValueError("Run this controller on the deployed cluster with its native Slurm site")
     site = replace(site, name=plan["site"])
     p = paths(site)
+    if args.resume:
+        index_path = Path(p["output_root"]) / ".run-index.json"
+        existing = read_json(index_path) if index_path.exists() else {}
+        if existing:
+            folder = Path(p["output_root"]) / next(iter(existing.values()))
+            requests = [read_json(a / "request.json") for a in (folder / "attempts").iterdir()]
+            if requests:
+                original = min(requests, key=lambda r: r["created_at"])["executable"]
+                site = replace(site, executable=original)
+                p = paths(site)
     build = executable_identity(p["executable"])
     if build["revision"] != plan["simulator_revision"] or build["build_options"]["ENABLE_NATIVE_ARCH"] != "OFF":
         raise ValueError("Benchmark requires the recorded portable simulator build")
