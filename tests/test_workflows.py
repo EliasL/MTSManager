@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -62,6 +63,86 @@ class ConfigTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_manager_only_update_keeps_source_until_its_identity_changes(self):
+        from MTS_Management.deployments import update_managers
+        from MTS_Management.provenance import scripts_identity
+        expected = {"scripts": scripts_identity()["sha256"], "source": "source-one", "campaigns": {}}
+        identity = expected | {"scripts": "older-manager"}
+        versions = {"profiles": {"cluster": {"state": "mismatch", "identity": identity}}}
+        source_record = {"branch": "main", "revision": "fixture", "source_sha256": expected["source"]}
+        transferred = []
+        def archive(source, destination):
+            destination.write_bytes(b"verified source snapshot")
+            return source_record
+        def transport(command, **kwargs):
+            for argument in command:
+                if argument.endswith("/source.tar.gz"):
+                    transferred.append(Path(argument).read_bytes())
+            return subprocess.CompletedProcess(command, 0, "", "")
+        with tempfile.TemporaryDirectory() as temporary:
+            sites = Path(temporary) / "sites.toml"
+            sites.write_text('[sites.cluster]\nssh="cluster"\ndirectory="/work/MTS"\n'
+                             'manager_directory="/work/manager"\nsource="MTS2D"\n')
+            with patch("MTS_Management.deployments.deployment_expectation", return_value=expected), \
+                    patch("MTS_Management.deployments.check_deployment", return_value=versions), \
+                    patch("MTS_Management.deployments.subprocess.run", side_effect=transport), \
+                    patch("MTS_Management.deployments.call", return_value={"scripts": scripts_identity()}), \
+                    patch("MTS_Management.cluster.call", return_value={"scripts": scripts_identity()}), \
+                    patch("MTS_Management.cluster.source_identity", return_value=source_record), \
+                    patch("MTS_Management.cluster.source_archive", side_effect=archive):
+                result = update_managers(sites, log=lambda _: None)
+                self.assertEqual(result["updated_sites"], ["cluster"])
+                self.assertEqual(transferred, [])
+                identity["source"] = "older-source"
+                result = update_managers(sites, log=lambda _: None)
+                self.assertEqual(result["updated_sites"], ["cluster"])
+                self.assertEqual(transferred, [b"verified source snapshot"])
+
+    def test_servers_update_concurrently_and_share_uploads_within_each_host(self):
+        from MTS_Management.deployments import update_managers
+        from MTS_Management.provenance import scripts_identity
+        barrier = threading.Barrier(2, timeout=3)
+        with tempfile.TemporaryDirectory() as temporary:
+            sites = Path(temporary) / "sites.toml"
+            sites.write_text('[sites.first]\nssh="one"\ndirectory="~/workspace"\n'
+                             '[sites.second]\nssh="one"\ndirectory="~/workspace"\n'
+                             '[sites.third]\nssh="two"\ndirectory="~/workspace"\n')
+            def transport(command, **kwargs):
+                if command[0] == "ssh" and "/.local/share/mts/manager" in command[-1]:
+                    barrier.wait()  # Both servers must reach their first write concurrently.
+                return subprocess.CompletedProcess(command, 0, "", "")
+            with patch("MTS_Management.deployments.subprocess.run", side_effect=transport), \
+                    patch("MTS_Management.deployments.call", return_value={"scripts": scripts_identity()}), \
+                    patch("MTS_Management.deployments.deploy") as upload:
+                result = update_managers(sites, force=True, log=lambda _: None)
+            self.assertEqual(result["updated_sites"], ["first", "second", "third"])
+            self.assertEqual({c.args[0].name for c in upload.call_args_list}, {"first", "third"})
+            self.assertEqual(len(read_json(sites.parent / ".state/manager-deployments.json")), 2)
+
+    def test_update_skips_current_profiles_and_succeeds_without_any_transfers(self):
+        from MTS_Management.deployments import update_managers
+        from MTS_Management.provenance import scripts_identity
+        versions = {"profiles": {"first": {"state": "current"}, "second": {"state": "mismatch"}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            sites = Path(temporary) / "sites.toml"
+            sites.write_text('[sites.first]\nssh="cluster"\n[sites.second]\nssh="cluster"\n'
+                             '[sites.disabled]\nssh="disabled"\ndisabled=true\n')
+            with patch("MTS_Management.deployments.deployment_expectation", return_value={
+                    "scripts": scripts_identity()["sha256"], "source": "source-one", "campaigns": {}}), \
+                    patch("MTS_Management.deployments.check_deployment", return_value=versions), \
+                    patch("MTS_Management.deployments.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")) as transport, \
+                    patch("MTS_Management.deployments.call", return_value={"scripts": scripts_identity()}), \
+                    patch("MTS_Management.deployments.deploy") as upload:
+                result = update_managers(sites, log=lambda _: None)
+                self.assertEqual((result["updated_sites"], result["skipped_sites"]), (["second"], ["first"]))
+                self.assertEqual([c.args[0].name for c in upload.call_args_list], ["second"])
+                versions["profiles"]["second"]["state"] = "current"
+                transport.reset_mock(); upload.reset_mock()
+                result = update_managers(sites, log=lambda _: None)
+                self.assertEqual(result["skipped_sites"], ["first", "second"])
+                transport.assert_not_called()
+                upload.assert_not_called()
+
     def test_manager_update_preserves_worker_paths_and_activates_only_verified_profiles(self):
         from MTS_Management.cluster import load_sites
         from MTS_Management.deployments import update_managers
@@ -81,8 +162,8 @@ class DeploymentTests(unittest.TestCase):
             with patch("MTS_Management.deployments.subprocess.run", return_value=
                        subprocess.CompletedProcess([], 0, "", "")), \
                     patch("MTS_Management.deployments.deploy"), patch("MTS_Management.deployments.call", side_effect=verify):
-                result = update_managers(sites_file, log=lambda _: None)
-                update_managers(sites_file, log=lambda _: None)
+                result = update_managers(sites_file, log=lambda _: None, force=True)
+                update_managers(sites_file, log=lambda _: None, force=True)
             loaded = load_sites(sites_file)
             self.assertTrue(loaded["first"].manager_directory)
             self.assertEqual(loaded["second"].manager_directory, "")
@@ -104,7 +185,7 @@ class DeploymentTests(unittest.TestCase):
             with patch("MTS_Management.deployments.subprocess.run", return_value=
                        subprocess.CompletedProcess([], 0, "", "")), \
                     patch("MTS_Management.deployments.deploy"), patch("MTS_Management.deployments.call", side_effect=verify):
-                result = update_managers(sites, log=lambda _: None)
+                result = update_managers(sites, log=lambda _: None, force=True)
             self.assertEqual(result["updated_sites"], ["cluster"])
             self.assertEqual(load_sites(sites)["cluster"].manager_directory, "/work/MTS/manager")
 
@@ -180,6 +261,25 @@ print("finished",flush=True)
         shutil.rmtree(folder)
         self.assertEqual(inventory(self.output, hard_refresh=True), [])
         self.assertEqual(cached_inventory(self.output)["pending"], [])
+
+    def test_batch_inventory_refresh_reads_only_requested_runs_and_keeps_full_timestamp(self):
+        first, second = Config(seed=1), Config(seed=2)
+        requested = self.prepare(first).parents[1]
+        unrelated = self.prepare(second).parents[1]
+        before = inventory(self.output)
+        full_snapshot = cached_inventory(self.output)
+        (unrelated / "config.conf").write_text("Unrelated run must not be read")
+        (requested / "macroData.csv").write_text("load,value\n0,1\n0.25,2\n")
+        site = Site(name="fixture", directory=str(self.root), output_root=str(self.output))
+        with patch("MTS_Management.inventory_cache.now", return_value="must not replace full refresh time"):
+            rows = serve({"site": asdict(site), "operation": "inventory", "options": {
+                "config_hashes": [first.config_hash], "hard_refresh": True}})
+        self.assertEqual([(r["config_hash"], r["progress"]["fraction"]) for r in rows], [(first.config_hash, .25)])
+        after = cached_inventory(self.output)
+        self.assertEqual(after["updated_at"], full_snapshot["updated_at"])
+        self.assertEqual(next(r for r in after["rows"] if r["config_hash"] == second.config_hash),
+                         next(r for r in before if r["config_hash"] == second.config_hash))
+        self.assertEqual(inventory(self.output, config_hashes=[], hard_refresh=True), [])
 
     def test_inventory_cache_cannot_resurrect_finished_run_during_restart(self):
         attempt = self.prepare()

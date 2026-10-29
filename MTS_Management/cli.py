@@ -49,6 +49,9 @@ def parser():
     c.add_argument("--name", required=True)
     c.add_argument("--base", type=Path, required=True)
     c.add_argument("--vary", action="append", required=True, help="e.g. 'seed=[0,1,2]'")
+    c = commands.add_parser("update-managers", help="Update outdated remote MTS installations")
+    c.add_argument("--host", help="Limit the update to one SSH destination")
+    c.add_argument("--force", action="store_true", help="Update even when installed versions match")
     for name in ("build", "deploy", "inventory", "inventory-cache", "inventory-update", "reindex", "info"):
         c = commands.add_parser(name)
         c.add_argument("--site", default="local")
@@ -119,6 +122,10 @@ def main(argv=None):
         return
     if args.command == "_execute":
         execute(args.attempt)
+        return
+    if args.command == "update-managers":
+        from .deployments import update_managers
+        print(json.dumps(update_managers(args.sites, host=args.host, force=args.force), indent=2))
         return
     if args.command == "config":
         if args.path.exists():

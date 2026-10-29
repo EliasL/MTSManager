@@ -32,6 +32,7 @@ class CampaignCompatibilityTests(unittest.TestCase):
         expected = {
             'magi_benchmark_oct26': '872d3ae075becb76fe4604cba84b3e097723ca6c9e7cf5a11f7155294d5e1d6a',
             'magi_pilot_oct26': '5b1b80546018295fae27056ae0b64860a9d3d2ec5deb66dc3b5e2e5677520222',
+            'magi_chain_smoke_oct26': 'd4d4d483f742b3c817afa82f5ae6854f99d1119b69fe9ebc7bd2bb1143a439ec',
         }
         for directory, fingerprint in expected.items():
             with self.subTest(campaign=directory), tempfile.TemporaryDirectory() as td:

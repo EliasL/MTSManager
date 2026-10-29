@@ -1,0 +1,12 @@
+{
+  "executables": [
+    {
+      "path": "/nfs/homes/elias.lundheim/simulation/MTSManager-pilot-20261022/build/MTS2D",
+      "sha256": "a55bcc4465b4c5579879ea49a643374021907ac46931346add2e98b0b59465a3",
+      "site": "magi"
+    }
+  ],
+  "missing_settings": {
+    "tangentBackend": "eigen"
+  }
+}

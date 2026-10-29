@@ -31,10 +31,13 @@ def invalidate(output_root, config_hash=None):
                                "SET revision = runs.revision + 1, data = NULL", (config_hash,))
 
 
-def records(output_root):
+def records(output_root, *, hashes=None):
     with database(output_root) as connection:
+        query = "SELECT hash, revision, data FROM runs"
+        rows = (connection.execute(query) if hashes is None else
+                (row for h in hashes for row in connection.execute(query + " WHERE hash = ?", (h,))))
         return {h: (revision, json.loads(data) if data is not None else None)
-                for h, revision, data in connection.execute("SELECT hash, revision, data FROM runs")}
+                for h, revision, data in rows}
 
 
 def publish(output_root, revisions, updates, *, full=False):

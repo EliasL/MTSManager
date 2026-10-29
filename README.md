@@ -136,11 +136,27 @@ Use it after changes made outside MTSManager. Directory-size estimation remains
 a separate `--refresh-sizes` option. These commands require the updated manager
 on the execution host.
 
+The manager's `inventory` operation also accepts `config_hashes`, a list of full
+configuration hashes. It refreshes matching indexed runs in one request, retains
+unrelated cached records and leaves the full-inventory timestamp unchanged. An
+empty list selects no runs. The GUI uses this operation for campaign refreshes.
+If the run index is absent, the manager constructs it before reading the selection.
+
 The desktop application's Update MTS on servers action transfers the manager,
 campaign directories and verified simulator source. The shared package identity
 is checked before recording profile locations in `.state/manager-deployments.json`.
 Source compilation remains separate. Retained binaries and scientific output
 are preserved.
+
+`mts update-managers` performs the same update from the command line. Enabled SSH
+destinations update concurrently using threads; profiles sharing a destination
+update together. Current manager, source and campaign versions are checked before
+transferring files, and matching profiles are skipped. `--host cluster` selects
+one SSH destination. `mts update-managers --force` updates all enabled destinations
+without skipping current versions; force is available only outside the GUI.
+Component comparisons also skip an unchanged simulator source when updating
+manager code or campaign definitions. A source archive is created and installed
+only when its recorded checksum differs or the update is forced.
 
 Submission records and `.state/job-log.jsonl` identify requests, accepted jobs
 and administrative actions. Each attempt saves the original command, environment

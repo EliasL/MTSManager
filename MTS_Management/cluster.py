@@ -140,7 +140,7 @@ def serve(payload, *, cancel=None):
             raise ValueError("Cached inventory reads do not accept refresh options")
         return cached_inventory(p["output_root"])
     if op == "inventory_update":
-        if "config_hash" in options:
+        if "config_hash" in options or "config_hashes" in options:
             raise ValueError("Inventory database export requires a full refresh")
         Path(p["output_root"]).mkdir(parents=True, exist_ok=True)
         inventory(p["output_root"], cancel=cancel, **options)

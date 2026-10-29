@@ -114,27 +114,37 @@ def rebuild_index(output_root):
     return index
 
 
-def inventory(output_root, *, config_hash=None, refresh_sizes=False, hard_refresh=False, cancel=None):
+def inventory(output_root, *, config_hash=None, config_hashes=None, refresh_sizes=False, hard_refresh=False, cancel=None):
+    if config_hashes is not None:
+        if config_hash is not None or not isinstance(config_hashes, list) or any(
+                not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h)
+                for h in config_hashes):
+            raise ValueError("config_hashes requires a list of full configuration hashes, without config_hash")
+        if not config_hashes:
+            return []
     root = Path(output_root).resolve()
     if not root.exists():
         return []
     index_file = root / ".run-index.json"
-    if not index_file.exists() or (hard_refresh and config_hash is None):
+    if not index_file.exists() or (hard_refresh and config_hash is None and config_hashes is None):
         rebuild_index(root)
     # Serialise refreshes, without blocking lifecycle invalidation or cached readers.
     with locked(root / ".inventory.lock", cancel=cancel):
-        return _inventory(root, config_hash=config_hash, refresh_sizes=refresh_sizes,
+        return _inventory(root, config_hash=config_hash, config_hashes=config_hashes, refresh_sizes=refresh_sizes,
                           hard_refresh=hard_refresh, cancel=cancel)
 
 
-def _inventory(root, *, config_hash, refresh_sizes, hard_refresh, cancel):
+def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh, cancel):
     index = read_json(root / ".run-index.json")
     if config_hash and (len(config_hash) < 20 or any(c not in "0123456789abcdef" for c in config_hash)):
         raise ValueError("Use at least the complete 20-character configuration hash")
     matches = [h for h in index if not config_hash or h.startswith(config_hash)]
     if config_hash and len(matches) > 1:
         raise ValueError("Ambiguous configuration hash")
-    cached = records(root)
+    if config_hashes is not None:
+        requested = set(config_hashes)
+        matches = [h for h in index if h in requested]
+    cached = records(root, hashes=matches if config_hash or config_hashes is not None else None)
     result, updates, revisions = [], [], {}
     for h in matches:
         if cancel is not None and cancel.is_set():
@@ -179,7 +189,7 @@ def _inventory(root, *, config_hash, refresh_sizes, hard_refresh, cancel):
         updates.append(row)
     if cancel is not None and cancel.is_set():
         raise CancelledError("Inventory aborted")
-    publish(root, revisions, updates, full=config_hash is None)
+    publish(root, revisions, updates, full=config_hash is None and config_hashes is None)
     return result
 
 
