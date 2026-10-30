@@ -205,7 +205,7 @@ def serve(payload, *, cancel=None):
     raise ValueError(f"Unknown remote operation: {op}")
 
 
-def call(site, operation, *, timeout=30, log=None, cancel=None, **options):
+def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, **options):
     if site.disabled:
         raise ValueError(f"Connection {site.ssh or site.name} is disabled")
     settings = asdict(site)
@@ -215,11 +215,15 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, **options):
     if manager_directory:
         module = "MTS_Management"
     payload = {"site": settings, "operation": operation, "options": options}
+    if _program is not None:
+        payload["program"] = _program
     if cancel is not None and cancel.is_set():
         raise CancelledError("Operation aborted")
-    if not site.ssh and not site.setup:
+    if not site.ssh and not site.setup and _program is None:
         return serve(payload, cancel=cancel)
     python = [site.python, '-u', '-m', module, '_serve']
+    if _program is not None:
+        python = [site.python, '-u', '-c', "import json,sys; __mts_control_request=json.load(sys.stdin); exec(__mts_control_request.pop('program'))"]
     reader = site.ssh and operation in {"inventory", "inventory_cached", "inventory_update", "logs"}
     if reader:
         payload["reader_timeout"] = max(1, int(timeout))
@@ -234,42 +238,51 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, **options):
     args = (["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
              site.ssh, "bash -lc " + shlex.quote("set -e\n" + cmd)] if site.ssh else
             ["bash", "-lc", "set -e\n" + site.setup + "\ncd " + shell_path(site.directory) +
-             "\n" + shlex.join([sys.executable, "-u", "-m", module, "_serve"])])
+             "\n" + shlex.join([sys.executable, *python[1:]] if _program is not None else
+                                 [sys.executable, "-u", "-m", module, "_serve"])])
     if log:
         log("$ " + shlex.join(args))
     started = time.monotonic()
-    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, text=True) as process:
-        data = canonical(payload).decode()
-        try:
-            while True:
-                if cancel is not None and cancel.is_set():
-                    raise CancelledError("Operation aborted; previous cached inventory retained")
-                if time.monotonic() - started >= timeout:
-                    raise subprocess.TimeoutExpired(args, timeout)
-                try:
-                    stdout, stderr = process.communicate(data, timeout=0.2)
-                    break
-                except subprocess.TimeoutExpired:
-                    data = None
-        except BaseException as error:
-            process.terminate()
+    # Polling communicate() with input=None after a timeout can leave a large
+    # request only partly written. A file supplies the complete request and EOF.
+    with tempfile.TemporaryFile() as request:
+        request.write(canonical(payload))
+        request.seek(0)
+        with subprocess.Popen(args, stdin=request, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as process:
             try:
-                stdout, stderr = process.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-            if isinstance(error, subprocess.TimeoutExpired):
-                error.output, error.stderr = stdout, stderr
-            raise
-        if log and stderr.strip():
-            log(stderr.rstrip())
-        if process.returncode:
-            raise RuntimeError(f"{site.ssh or site.name}: {operation} failed (exit {process.returncode}):\n"
-                               + (stderr.strip() or stdout.strip() or "No diagnostic output"))
-    if log:
-        log(f"Received {len(stdout.encode())} bytes in {time.monotonic() - started:.2f} s")
-    return json.loads(stdout)
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise CancelledError("Operation aborted; previous cached inventory retained")
+                    if time.monotonic() - started >= timeout:
+                        raise subprocess.TimeoutExpired(args, timeout)
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+            except BaseException as error:
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                if isinstance(error, subprocess.TimeoutExpired):
+                    error.output, error.stderr = stdout, stderr
+                raise
+            if log and stderr.strip():
+                log(stderr.rstrip())
+            if process.returncode:
+                if reader and process.returncode in {-14, 142}:
+                    raise subprocess.TimeoutExpired(args, timeout, output=stdout, stderr=stderr)
+                if site.ssh and process.returncode == 255:
+                    raise ConnectionError(f"{site.ssh}: {stderr.strip() or stdout.strip()}")
+                raise RuntimeError(f"{site.ssh or site.name}: {operation} failed (exit {process.returncode}):\n"
+                                   + (stderr.strip() or stdout.strip() or "No diagnostic output"))
+        if log:
+            log(f"Received {len(stdout.encode())} bytes in {time.monotonic() - started:.2f} s")
+        return json.loads(stdout)
 
 
 def across(sites, operation, *, per_site=None, **options):

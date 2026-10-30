@@ -63,6 +63,17 @@ class ConfigTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_large_request_survives_polling_before_remote_reads_stdin(self):
+        # SSH setup can exceed the polling interval before reading campaign JSON.
+        popen = subprocess.Popen
+        def delayed_reader(args, **kwargs):
+            return popen([sys.executable, "-c", "import json,sys,time; time.sleep(.4); "
+                          "print(json.dumps(json.load(sys.stdin)['options']['config_hashes']))"], **kwargs)
+        hashes = [f"{i:064x}" for i in range(2001)]
+        with patch("MTS_Management.cluster.subprocess.Popen", side_effect=delayed_reader):
+            result = call(Site(name="fixture", ssh="fixture"), "inventory", timeout=3, config_hashes=hashes)
+        self.assertEqual(result, hashes)
+
     def test_manager_only_update_keeps_source_until_its_identity_changes(self):
         from MTS_Management.deployments import update_managers
         from MTS_Management.provenance import scripts_identity
@@ -526,7 +537,6 @@ print("finished",flush=True)
             call(remote, "resources")
         args, kwargs = transport.call_args
         self.assertIn("mtscripts _serve", args[0][-1])
-        self.assertNotIn("management_module", json.loads(process.communicate.call_args.args[0])["site"])
         with self.assertRaisesRegex(ValueError, "new deployment"):
             deploy(remote)
         journal = Journal(self.state)

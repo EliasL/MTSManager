@@ -253,6 +253,26 @@ Use `mts sync-log --site cluster` to merge remote history locally and `mts histo
 to read it. If a submission connection fails, inspect history and scheduler state
 before retrying: the job may already have been accepted.
 
+## Queued Slurm control
+
+Select pending jobs by their validated configuration settings. This example
+reviews square L=800 runs across enabled Slurm profiles:
+
+```sh
+python -m MTS_Management.slurm_control --sites sites.toml --site '*' \
+  --action hold --match all --criteria '[{"field":"L","operator":"eq","value":800}]'
+```
+
+The default only reviews matches. Add `--apply` to execute, or use the desktop
+SLURM control panel to review and apply an exact set of job IDs. Actions are
+`hold`, `release` (user-held jobs) and `cancel` (pending jobs only). Running jobs
+are excluded. Multiple criteria support `--match all` or `--match any`, with
+`eq`, `ne`, `lt`, `le`, `gt`, `ge` and string `contains` operators. Other property
+names use configuration keys; `campaign` selects the manifest's campaign name.
+Scheduler outcomes are checked and journalled; failures are not retried
+automatically. The client sends the control program over the configured
+transport without replacing the remote manager or existing worker commands.
+
 ## Downloading and reading data
 
 Replace `HASH` below with a hash from `mts inventory --site cluster`:
