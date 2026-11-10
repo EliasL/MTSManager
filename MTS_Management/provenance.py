@@ -43,6 +43,22 @@ def source_hash(source):
     return digest({p: file_digest(source / p) for p in source_files(source)})
 
 
+def _uncommitted_source_error(source, untracked=()):
+    from .errors import ExpectedError
+
+    extra = f"\n\nFiles outside Git: {', '.join(sorted(untracked))}" if untracked else ""
+    return ExpectedError(
+        "Commit all changes to the MTS2D build inputs before building or uploading the simulator. "
+        "This lets MTS record the exact source revision used by each run.\n\n"
+        f"Review the changes in {source}. Stage only the files you intend to commit.\n\n"
+        "git status --short\n"
+        "git diff\n"
+        "git add <files>\n"
+        "git diff --cached\n"
+        'git commit -m "Describe the simulator changes"' + extra
+    )
+
+
 def source_identity(source):
     source = Path(source).resolve()
     if (source / ".git").exists():
@@ -59,12 +75,12 @@ def source_identity(source):
             raise ValueError(f"New simulations require MTS2D main; found {branch!r}")
         if command(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no",
                     "--", "CMakeLists.txt", "cmake", "src", "libs"]):
-            raise ValueError("Commit tracked MTS2D changes before preparing a build")
+            raise _uncommitted_source_error(source)
         tracked = set(source_files(source))
         actual = {str(p.relative_to(source)) for folder in ("src", "cmake")
                   for p in (source / folder).rglob("*") if p.is_file()}
         if actual - tracked:
-            raise ValueError(f"Untracked source inputs: {sorted(actual - tracked)}")
+            raise _uncommitted_source_error(source, actual - tracked)
         return {"revision": revision, "branch": branch, "source_sha256": source_hash(source)}
     record = read_json(source / "SOURCE.json")
     if record["branch"] != "main" or record["source_sha256"] != source_hash(source):

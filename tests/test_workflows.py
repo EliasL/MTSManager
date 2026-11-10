@@ -63,6 +63,12 @@ class ConfigTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def setUp(self):
+        # Transport fixtures use a verified local simulator snapshot.
+        fixture = patch("MTS_Management.deployments.source_identity", return_value={"source_sha256": "source-one"})
+        fixture.start()
+        self.addCleanup(fixture.stop)
+
     def test_large_request_survives_polling_before_remote_reads_stdin(self):
         # SSH setup can exceed the polling interval before reading campaign JSON.
         popen = subprocess.Popen

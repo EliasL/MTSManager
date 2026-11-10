@@ -9,7 +9,7 @@ import subprocess
 
 from .cluster import call, load_sites, manager_key, shell_path, deploy
 from .files import digest, locked, read_json, write_json
-from .provenance import scripts_identity, source_hash
+from .provenance import scripts_identity, source_hash, source_identity
 from .runner import PACKAGE_ROOT
 
 
@@ -17,7 +17,7 @@ SSH = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
        "-o", "ControlPath=none", "-o", "ControlMaster=no"]
 
 
-def deployment_expectation():
+def deployment_expectation(*, source_sha256=None):
     """Version records used by connection checks; no executable is launched."""
     root = PACKAGE_ROOT / "campaigns"
     campaigns = {}
@@ -29,7 +29,7 @@ def deployment_expectation():
             data.pop("executables", None)
         campaigns[str(path.relative_to(root))] = digest(data)
     return {"scripts": scripts_identity()["sha256"],
-            "source": source_hash(PACKAGE_ROOT.parent / "MTS2D"), "campaigns": campaigns}
+            "source": source_sha256 or source_hash(PACKAGE_ROOT.parent / "MTS2D"), "campaigns": campaigns}
 
 
 def check_deployment(profiles, expected):
@@ -90,14 +90,16 @@ def update_managers(site_file, *, log=print, host=None, force=False):
     """Deploy the installed manager once per SSH destination, then activate profiles."""
     site_file = Path(site_file).resolve()
     sites = load_sites(site_file)
-    expected = scripts_identity()
-    expected_deployment = deployment_expectation() if not force else None
     groups = {}
     for site in sites.values():
         if site.ssh and (host is None or site.ssh == host):
             groups.setdefault(site.ssh, []).append(site)
     if not groups:
         raise ValueError("No remote server profiles are configured")
+    local_source = PACKAGE_ROOT.parent / "MTS2D"
+    identity = source_identity(local_source)
+    expected = scripts_identity()
+    expected_deployment = deployment_expectation(source_sha256=identity["source_sha256"]) if not force else None
     registry_file = site_file.parent / ".state/manager-deployments.json"
     updated, skipped, errors = [], [], {}
     def run(command):
@@ -164,7 +166,7 @@ def update_managers(site_file, *, log=print, host=None, force=False):
                 if workspace not in uploaded:
                     include_source = changed(site, "source")
                     log(f"{site.name}: " + ("uploading simulator source" if include_source else "simulator source is current; upload skipped"))
-                    deploy(candidate, include_source=include_source, local_source=PACKAGE_ROOT.parent / "MTS2D")
+                    deploy(candidate, include_source=include_source, local_source=local_source)
                     uploaded.add(workspace)
                 if info["scripts"] != expected:
                     raise ValueError("Deployed manager does not match the local source version")

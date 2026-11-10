@@ -371,6 +371,11 @@ def deploy(site, *, include_source=False, local_source=None):
         raise ValueError("deploy requires a remote site")
     if site.management_module != "MTS_Management":
         raise ValueError("For a new deployment, select MTS_Management and a new remote directory first")
+    source_record = None
+    if include_source:
+        if not local_source:
+            raise ValueError("--source is required when uploading MTS2D")
+        source_record = source_identity(local_source)
     directory = site.directory
     if not directory.startswith("/"):
         if not directory.startswith("~/"):
@@ -378,11 +383,7 @@ def deploy(site, *, include_source=False, local_source=None):
         # Resolve HOME using SSH, not the local user's home directory.
         home = subprocess.check_output(["ssh", "-T", site.ssh, "printenv HOME"], text=True).strip()
         directory = str(Path(home) / directory[2:])
-    source_record = None
     if include_source:
-        if not local_source:
-            raise ValueError("--source is required when uploading MTS2D")
-        source_record = source_identity(local_source)
         source_path = site.source
         if source_path.startswith("~/"):
             home = subprocess.check_output(["ssh", "-T", site.ssh, "printenv HOME"], text=True).strip()

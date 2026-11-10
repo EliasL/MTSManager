@@ -19,6 +19,10 @@ class Config:
         if unknown:
             raise ValueError(f"Unknown current MTS2D settings: {sorted(unknown)}")
         values = DEFAULTS | settings
+        if values["deformation"] == "sequentialSlip" and isinstance(values["directions"], str):
+            for key, value in (("segmentLoad", 1.0), ("totalLoad", values["directions"].count(",") + 1.0)):
+                if key not in settings:
+                    values[key] = value
         for key, default in DEFAULTS.items():
             value = values[key]
             if isinstance(default, float) and type(value) in (float, int):
@@ -37,7 +41,7 @@ class Config:
         choices = {
             "stopWhen": {"all", "any"},
             "loading": {"relaxation", "reversibility", "noRelaxation"},
-            "deformation": {"simpleShear", "directDisplacement"},
+            "deformation": {"simpleShear", "directDisplacement", "sequentialSlip", "compression", "tension"},
             "boundary": {"fixed", "periodic", "anchored", "periodicAnchored"},
             "reconnectionMethod": {"none", "edgeFlip", "delaunay"},
             "minimizer": {"LBFGS", "CG", "FIRE"},
@@ -54,9 +58,30 @@ class Config:
             raise ValueError("rows, cols, nrThreads and LBFGSNrCorrections must be positive")
         if v["loadIncrement"] == 0 or v["totalLoad"] < 0 or v["segmentLoad"] < 0:
             raise ValueError("Invalid loading budget/increment")
-        directions = v["directions"].split(",")
-        if any(d not in {"horizontal", "vertical", "+horizontal", "+vertical",
-                         "-horizontal", "-vertical"} for d in directions):
+        directions = "".join(v["directions"].split()).split(",")
+        if v["deformation"] == "sequentialSlip":
+            if v["boundary"] != "anchored" or min(v["rows"], v["cols"]) < 2:
+                raise ValueError("sequentialSlip requires an anchored mesh of at least 2 by 2 nodes")
+            if (v["startLoad"] != 0 or v["segmentLoad"] != 1 or v["repeat"] or
+                    v["totalLoad"] != len(directions) or v["loadIncrement"] <= 0 or
+                    any(v[k] for k in ("stopAfterSteps", "stopAfterPlasticSteps", "stopAfterElasticSteps",
+                                       "stopAfterEnergyDrops", "stopAfterEnergyIncreases"))):
+                raise ValueError("sequentialSlip requires zero startLoad, positive loadIncrement, "
+                                 "one unit per entry, and a full sequence without repetition or early stops")
+            signs = {}
+            for token in directions:
+                match = re.fullmatch(r"([+-]?)([12])(?:\.([0-9]{1,9}))?", token)
+                if not match:
+                    raise ValueError(f"Invalid slip entry: {token}")
+                sign, system, fraction = match.groups()
+                if signs.setdefault(system, sign == "-") != (sign == "-"):
+                    raise ValueError("Each slip system must use a single sign")
+                size = v["rows" if system == "1" else "cols"]
+                fraction = fraction or "5"
+                if not 1 <= size * int(fraction) // 10**len(fraction) < size:
+                    raise ValueError(f"Slip entry must select an interior split on the edge: {token}")
+        elif any(d not in {"horizontal", "vertical", "+horizontal", "+vertical",
+                           "-horizontal", "-vertical"} for d in directions):
             raise ValueError("Invalid directions")
         if (len(directions) > 1 or v["repeat"]) and v["segmentLoad"] <= 0:
             raise ValueError("Multiple/repeated directions require positive segmentLoad")
@@ -66,6 +91,13 @@ class Config:
             raise ValueError("Invalid startLoad/totalLoad")
         if v["totalLoad"] > 0 and v["startLoad"] + v["totalLoad"] <= v["startLoad"]:
             raise ValueError("totalLoad is too small to advance startLoad")
+        if v["deformation"] in {"compression", "tension"} and (
+                v["boundary"] not in {"periodic", "fixed"} or
+                len(directions) != 1 or directions[0].startswith("-") or
+                v["repeat"] or v["segmentLoad"] != 0 or v["loadIncrement"] <= 0 or v["startLoad"] < 0 or
+                (v["deformation"] == "compression" and v["startLoad"] + v["totalLoad"] >= 1)):
+            raise ValueError("Affine compression and tension require periodic or fixed boundaries, "
+                             "one unsigned direction, and nonnegative engineering strain with positive stretch and increment")
         if v["reversibilityTolerance"] <= 0 or v["energyDropThreshold"] < 0:
             raise ValueError("Invalid reversibilityTolerance/energyDropThreshold")
         if any(v[k] < 0 for k in ("stopAfterSteps", "stopAfterPlasticSteps",
@@ -131,10 +163,10 @@ class Config:
         return result
 
     @classmethod
-    def read(cls, path, *, expected_name=None):
-        """Read original settings, resolving omissions through campaign metadata."""
+    def parse_settings(cls, text):
+        """Parse native configuration text without assigning a run identity."""
         values = {}
-        for line in Path(path).read_text().splitlines():
+        for line in text.splitlines():
             line = line.split("#", 1)[0].strip()
             if not line:
                 continue
@@ -142,18 +174,26 @@ class Config:
             if key in values:
                 raise ValueError(f"Duplicate setting: {key}")
             values[key] = value
-        name = values.pop("name")
+        name = values.pop("name", None)
         for key in values:
             if key not in DEFAULTS:
                 raise ValueError(f"Unknown setting: {key}")
             default = DEFAULTS[key]
             if type(default) is bool:
-                if values[key] not in ("true", "false"):
-                    raise ValueError(f"{key} must be true or false")
-                values[key] = values[key] == "true"
+                if values[key].lower() not in ("true", "false", "1", "0"):
+                    raise ValueError(f"{key} must be true, false, 1, or 0")
+                values[key] = values[key].lower() in ("true", "1")
             else:
                 values[key] = type(default)(values[key])
+        return name, values
+
+    @classmethod
+    def read(cls, path, *, expected_name=None):
+        """Read original settings, resolving omissions through campaign metadata."""
+        name, values = cls.parse_settings(Path(path).read_text())
         result = cls.saved(values)
+        if name is None:
+            raise ValueError("Missing saved configuration name")
         if name != result.folder_name(name.split("[")[0]):
             raise ValueError("Configuration name/hash mismatch")
         if expected_name is not None and name != expected_name:
@@ -172,5 +212,8 @@ def sweep(base=None, **axes):
         if "L" in settings:
             size = settings.pop("L")
             settings.update(rows=size, cols=size)
-        result.append(Config(**(base.as_dict() | settings)))
+        values = base.as_dict() | settings
+        if values["deformation"] == "sequentialSlip" and "directions" in settings and "totalLoad" not in settings:
+            values.pop("totalLoad")
+        result.append(Config(**values))
     return result

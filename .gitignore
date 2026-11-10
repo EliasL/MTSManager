@@ -6,5 +6,6 @@ build*/
 output/
 .DS_Store
 /executables/
+/campaigns/gui/
 .source.lock
 /sites.lock

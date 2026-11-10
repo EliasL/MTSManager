@@ -4,12 +4,14 @@ import argparse
 from contextlib import redirect_stdout
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import sys
 
 from .cluster import across, call, deploy, fetch, load_sites, paths, serve, submit, sync_journals
 from .campaign import campaign_entries
 from .config import Config, sweep
+from .errors import EXPECTED_ERROR_EXIT, EXPECTED_ERROR_FORMAT, ExpectedError
 from .files import read_json, write_json
 from .journal import Journal
 from .runner import execute, launch, prepare, run_many
@@ -109,6 +111,17 @@ def parser():
 
 
 def main(argv=None):
+    try:
+        _run_command(argv)
+    except ExpectedError as error:
+        if os.environ.get(EXPECTED_ERROR_FORMAT) == "json":
+            print(json.dumps({"expected_error": str(error)}))
+        else:
+            print(str(error), file=sys.stderr)
+        raise SystemExit(EXPECTED_ERROR_EXIT) from None
+
+
+def _run_command(argv):
     args = parser().parse_args(argv)
     if args.command == "_serve":
         payload = json.load(sys.stdin)
