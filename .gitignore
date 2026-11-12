@@ -4,6 +4,8 @@ __pycache__/
 .state/
 build*/
 output/
+/output-archive/
+/campaigns-archive/
 .DS_Store
 /executables/
 /campaigns/gui/

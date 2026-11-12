@@ -114,7 +114,8 @@ def rebuild_index(output_root):
     return index
 
 
-def inventory(output_root, *, config_hash=None, config_hashes=None, refresh_sizes=False, hard_refresh=False, cancel=None):
+def inventory(output_root, *, config_hash=None, config_hashes=None, refresh_sizes=False, hard_refresh=False,
+              include_archived=False, cancel=None):
     if config_hashes is not None:
         if config_hash is not None or not isinstance(config_hashes, list) or any(
                 not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h)
@@ -130,8 +131,13 @@ def inventory(output_root, *, config_hash=None, config_hashes=None, refresh_size
         rebuild_index(root)
     # Serialise refreshes, without blocking lifecycle invalidation or cached readers.
     with locked(root / ".inventory.lock", cancel=cancel):
-        return _inventory(root, config_hash=config_hash, config_hashes=config_hashes, refresh_sizes=refresh_sizes,
+        rows = _inventory(root, config_hash=config_hash, config_hashes=config_hashes, refresh_sizes=refresh_sizes,
                           hard_refresh=hard_refresh, cancel=cancel)
+        if include_archived:
+            from .archive import archived_runs
+            rows.extend(row for row in archived_runs(root, config_hashes)
+                        if not config_hash or row["config_hash"].startswith(config_hash))
+        return rows
 
 
 def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh, cancel):
@@ -150,9 +156,16 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
         if cancel is not None and cancel.is_set():
             raise CancelledError("Inventory aborted")
         folder = root / index[h]
+        if not folder.exists():
+            from .archive import ARCHIVE_MARKER, archive_root
+            archive = archive_root(root)
+            if (archive / ARCHIVE_MARKER).exists() and (archive / folder.name / "manifest.json").is_file():
+                if read_json(archive / folder.name / "manifest.json")["config_hash"] == h:
+                    continue
         revision, row = cached.get(h, (0, None))
         revisions[h] = revision
         if (not hard_refresh and not refresh_sizes and row is not None and row["folder"] == str(folder)
+                and "run_date" in row
                 and row["status"]["state"] == "finished" and not row["queued_continuations"]
                 and row.get("settings_metadata") == config_metadata_stamp()):
             result.append(row)
@@ -163,6 +176,10 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
         requests = {attempt: read_json(attempt / "request.json") for attempt in (folder / "attempts").iterdir()}
         attempts = sorted(requests, key=lambda p: requests[p]["created_at"])
         statuses = {a: attempt_status(a) for a in attempts}
+        manifest_path = folder / "manifest.json"
+        run_date = next((statuses[a]["started_at"] for a in attempts if statuses[a].get("started_at")), None)
+        if run_date is None:
+            run_date = read_json(manifest_path).get("created_at")
         active = [a for a in attempts if statuses[a]["state"] in {"running", "stopping"}]
         queued = [a for a in attempts if statuses[a]["state"] in {"prepared", "queued"}]
         attempt = (active[-1] if active else queued[0] if queued else attempts[-1]) if attempts else None
@@ -177,7 +194,7 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
         row = {"config_hash": h, "folder": str(folder), "attempt": str(attempt) if attempt else None,
                        "settings_metadata": config_metadata_stamp(),
                        "executable": request.get("executable"), "build": request.get("build"),
-                       "manifest_sha256": file_digest(folder / "manifest.json"),
+                       "manifest_sha256": file_digest(manifest_path), "run_date": run_date,
                        "campaign": request.get("campaign"), "status": status,
                        "queued_continuations": len([a for a in queued if a != attempt]),
                        "attempts": [{"attempt": str(a), "status": statuses[a]} for a in attempts],

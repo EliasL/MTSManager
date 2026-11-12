@@ -134,6 +134,11 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         else:
             if folder.exists():
                 raise FileExistsError(f"Unmanaged output directory: {folder}")
+            from .archive import archived_runs
+            archived = archived_runs(output_root, {config.config_hash})
+            if archived:
+                from .errors import ExpectedError
+                raise ExpectedError(f"Restore the archived run and rebuild the inventory before launching: {archived[0]['folder']}")
             if checkpoint is not None or resume_latest:
                 raise ValueError("Resume requires the original managed output folder and configuration")
             folder.mkdir()
@@ -175,6 +180,17 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
 def event_fields(request):
     return {k: request[k] for k in ("attempt_id", "run_identity", "config_hash", "campaign",
                                    "site", "output_folder")}
+
+
+SCHEDULER_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
+                      "PREEMPTED", "NODE_FAIL", "BOOT_FAIL", "DEADLINE", "REVOKED"}
+
+
+def scheduler_state(job_id):
+    accounting = subprocess.run(["sacct", "-X", "-n", "-P", "-j", job_id,
+                                 "--format=JobIDRaw,State"], capture_output=True, text=True, check=True)
+    rows = [row.split("|") for row in accounting.stdout.splitlines()]
+    return next((r[1].split()[0].rstrip("+") for r in rows if r[0] == job_id), None)
 
 
 def set_status(attempt, state, **fields):
@@ -403,13 +419,8 @@ def stop(attempt):
                 state = "stopping"
             elif cancelled.returncode:
                 # A worker killed by the scheduler may have no final journal event.
-                accounting = subprocess.run(["sacct", "-X", "-n", "-P", "-j", status["scheduler_id"],
-                    "--format=JobIDRaw,State"], capture_output=True, text=True, check=True)
-                rows = [row.split("|") for row in accounting.stdout.splitlines()]
-                observed = next((r[1].split()[0] for r in rows if r[0] == status["scheduler_id"]), None)
-                terminal = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
-                            "PREEMPTED", "NODE_FAIL", "BOOT_FAIL", "DEADLINE", "REVOKED"}
-                if observed not in terminal:
+                observed = scheduler_state(status["scheduler_id"])
+                if observed not in SCHEDULER_TERMINAL:
                     raise RuntimeError(f"Cannot cancel/confirm job state: {cancelled.stderr}")
                 status["scheduler_terminal_state"] = observed
         elif read_json(attempt / "request.json").get("command"):

@@ -135,6 +135,30 @@ def serve(payload, *, cancel=None):
         return rebuild_index(p["output_root"])
     if op == "inventory":
         return inventory(p["output_root"], cancel=cancel, **options)
+    if op == "mesh_snapshots":
+        from .data import mesh_snapshots
+        folder = Path(options["folder"])
+        if (folder.parent != Path(p["output_root"]) or folder.is_symlink() or
+                not (folder / "manifest.json").is_file() or
+                file_digest(folder / "manifest.json") != options["manifest_sha256"]):
+            return {"error": "The remote simulation changed. Select it again in Monitor data."}
+        return {"frames": mesh_snapshots(folder)}
+    if op == "plot_seed_group":
+        from .data import plot_seed_group
+        from .errors import ExpectedError
+        try:
+            return {"runs": plot_seed_group(p["output_root"], **options)}
+        except ExpectedError as error:
+            return {"error": str(error)}
+    if op in {"archive", "restore"}:
+        from .archive import archive_simulations, restore_simulation
+        from .errors import ExpectedError
+        try:
+            if op == "archive":
+                return {"folders": archive_simulations(p["output_root"], p["state_dir"], options["runs"])}
+            return {"folder": restore_simulation(p["output_root"], p["state_dir"], options["run"])}
+        except ExpectedError as error:
+            return {"error": str(error)}
     if op == "inventory_cached":
         if options:
             raise ValueError("Cached inventory reads do not accept refresh options")
@@ -436,7 +460,8 @@ def fetch(site, config_hash, destination, *, kind="macro"):
     return fetch_many(site, [config_hash], destination, kind=kind)[0]
 
 
-def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only=False):
+def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only=False,
+               expected_manifests=None, retain_binaries=True, mesh_frames=None):
     """Validate one inventory, then transfer selected runs in one rsync call.
 
     completed_only skips absent/not-yet-terminated campaign members explicitly.
@@ -445,12 +470,18 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     if kind not in {"macro", "full"}:
         raise ValueError("Fetch kind must be macro or full")
     hashes = list(config_hashes)
+    if mesh_frames is not None:
+        from .data import MESH_SNAPSHOT
+        if kind != "macro" or len(hashes) != 1 or any(
+                name != Path(name).name or not MESH_SNAPSHOT.fullmatch(name) for name in mesh_frames):
+            raise ValueError("Mesh retrieval requires native snapshot names and a single simulation.")
     if len(set(hashes)) != len(hashes) or any(
             not re.fullmatch(r"[0-9a-f]{20,64}", h) for h in hashes):
         raise ValueError("Provide distinct configuration hashes of 20–64 hex characters")
     if not hashes:
         return []
-    available = call(site, "inventory")
+    options = {"config_hashes": hashes} if all(len(h) == 64 for h in hashes) else {}
+    available = call(site, "inventory", **options)
     selected = {}
     for prefix in hashes:
         matches = [r for r in available if r["config_hash"].startswith(prefix)]
@@ -464,6 +495,10 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     rows = sorted(selected.values(), key=lambda r: r["config_hash"])
     if not rows:
         return []
+    if expected_manifests is not None and any(
+            expected_manifests.get(r["config_hash"]) != r["manifest_sha256"] for r in rows):
+        from .errors import ExpectedError
+        raise ExpectedError("The remote run identity changed. Refresh Monitor data and try again.")
     from .campaign import install_campaign_files
     names = sorted({r["campaign"] for r in rows if r.get("campaign") not in (None, "AdHoc", "GUI")})
     if names:
@@ -489,13 +524,19 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     filters = (["--include=/*/", "--include=macroData.csv", "--include=config.conf",
                 "--include=manifest.json", "--include=termination.json", "--exclude=*"]
                if kind == "macro" else [])
+    files = [Path(r["folder"]).name + "/\n" for r in rows]
+    if mesh_frames is not None:
+        name = Path(rows[0]["folder"]).name
+        files = [f"{name}/{entry}\n" for entry in ("config.conf", "manifest.json")]
+        files.extend(f"{name}/data/{frame}\n" for frame in mesh_frames)
+        filters = []
     with tempfile.TemporaryDirectory() as temporary:
         listing = Path(temporary) / "runs.txt"
-        listing.write_text("".join(Path(r["folder"]).name + "/\n" for r in rows))
+        listing.write_text("".join(files))
         subprocess.run(["rsync", "-ar", "-e", "ssh -T", "--files-from=" + str(listing),
                         *filters, origin, str(destination) + "/"], check=True)
     for row in rows:
-        if site.ssh and row.get("executable") and row.get("build"):
+        if retain_binaries and site.ssh and row.get("executable") and row.get("build"):
             archive_binary(site, row, row.get("campaign"), PACKAGE_ROOT / ".state")
         target = destination / Path(row["folder"]).name
         if file_digest(target / "manifest.json") != row["manifest_sha256"]:
@@ -505,6 +546,6 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
         if row.get("termination") is None:
             (target / "termination.json").unlink(missing_ok=True)
     write_json(destination / "snapshot.json", dict(fetched_at=now(), site=site.name,
-               source_root=str(root), kind=kind, runs=[dict(config_hash=r["config_hash"],
+               source_root=str(root), kind=kind if mesh_frames is None else "mesh", runs=[dict(config_hash=r["config_hash"],
                manifest_sha256=r["manifest_sha256"]) for r in rows]))
     return [str(destination / Path(r["folder"]).name) for r in rows]
