@@ -90,8 +90,8 @@ run(configs[0], executable="../MTS2D/build/release/MTS2D", output_root="output",
 To start an individual run from a custom lattice mesh, use
 `mts run config.conf --initial-mesh initialMesh.vtu`. The manager saves the
 mesh with the prepared run and includes its SHA-256 checksum in the
-configuration identity. Use a build supporting custom initial meshes and
-select `none` or `edgeFlip` reconnection.
+configuration identity. Delaunay reconnection on a custom mesh requires a
+build with constrained Delaunay support.
 
 Each run has a readable label followed by a configuration hash:
 

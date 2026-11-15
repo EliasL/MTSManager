@@ -14,6 +14,7 @@ import time
 import uuid
 
 from .config import Config, validate_driven_edge
+from .data import last_macro_row
 from .errors import ExpectedError
 from .files import digest, file_digest, locked, now, read_json, write_json
 from .initial_mesh import MESH_FILE, mesh_bytes, mesh_checksum, verify_mesh
@@ -114,11 +115,45 @@ def attempt_status(attempt):
     return failure_status(attempt, status) if status["state"] == "failed" else status
 
 
+def completed_run(folder, config):
+    path = folder / "termination.json"
+    if not path.is_file():
+        return False
+    summary = read_json(path)["termination"]
+    row = last_macro_row(folder / "macroData.csv")
+    return row is not None and (summary["targetsMet"] or
+                                float(row["load"]) >= config["startLoad"] + config["totalLoad"])
+
+
+class RunConflict(ExpectedError):
+    """An existing run prevents a fresh launch."""
+
+
+def run_conflict(folder, statuses=()):
+    if any(status["state"] in ACTIVE for status in statuses):
+        return RunConflict(f"A run with these settings is active in {folder}. Stop it before removing its folder.")
+    return RunConflict(f"A run with these settings already exists in {folder}. "
+                       "Choose different settings or manually remove the existing folder before starting again.")
+
+
+def find_fresh_conflict(output_root, config, label=None):
+    root = Path(output_root).resolve()
+    index = root / ".run-index.json"
+    indexed = read_json(index).get(config.config_hash) if index.is_file() else None
+    for name in (indexed, config.folder_name(label)):
+        if name:
+            folder = root / name
+            if folder.exists() or folder.is_symlink():
+                attempts = folder / "attempts"
+                statuses = [attempt_status(p.parent) for p in attempts.glob("*/status.json")] \
+                    if not folder.is_symlink() and attempts.is_dir() else []
+                return str(run_conflict(folder, statuses))
+    return ""
+
+
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
             checkpoint=None, site="local", environment=None, after=None, continuation=None,
-            resume_selection=None, initial_mesh=None, log=None):
-    if not checkpoint and continuation is None:
-        validate_driven_edge(config.as_dict())
+            resume_selection=None, initial_mesh=None, skip_completed=False, log=None):
     if initial_mesh is not None and mesh_checksum(initial_mesh) != config["initialMeshSha256"]:
         raise ExpectedError("The initial mesh checksum differs from config.conf.")
     if initial_mesh is not None and (checkpoint or continuation is not None):
@@ -138,18 +173,6 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             requests = [read_json(p / "request.json") for p in prior.iterdir()]
             if requests:
                 executable = max(requests, key=lambda r: r["created_at"])["executable"]
-    executable = retain_executable(executable, Path(state_dir).resolve().parent / "executables")
-    build = executable_identity(executable)
-    if continuation is not None and build.get("execution_interface") != "folder-v1":
-        raise ValueError("Load further requires a current folder-based MTS2D build")
-    if resume_selection is not None and build.get("execution_interface") != "folder-v1":
-        raise ExpectedError("Resume requires a retained build with folder-based checkpoint loading.")
-    if config["initialMeshSha256"] and not supports_initial_mesh(build):
-        raise ExpectedError("Build MTS2D at the execution site to use a custom initial mesh.")
-    if not supports_current_configuration(build):
-        raise ValueError("Build MTS2D at the execution site to use the current configuration")
-    from .campaign import record_executable
-    record_executable(campaign, site, executable)
     output_root = Path(output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     resume_latest = checkpoint == "latest"
@@ -166,8 +189,11 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         matches = [p for h, p in index.items() if h.startswith(config.config_hash[:20])]
         if any(h != config.config_hash and h.startswith(config.config_hash[:20]) for h in index):
             raise ValueError("Truncated hash collision; extend the naming scheme")
-        if matches:
+        indexed = output_root / matches[0] if matches else None
+        if indexed is not None and (indexed.exists() or indexed.is_symlink() or checkpoint or resume_latest):
             folder = output_root / matches[0]
+        if folder.is_symlink():
+            raise run_conflict(folder)
         manifest_path = folder / "manifest.json"
         if resume_selection is not None:
             from .continuation import checkpoint_files, source_run
@@ -181,8 +207,8 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                 if saved.as_dict() != config.as_dict():
                     raise ExpectedError("The saved configuration changed. Refresh Monitor data.")
                 checkpoint_files(folder)
-        if continuation is not None and (matches or folder.exists() or folder.is_symlink()):
-            raise ValueError("A run with these settings already exists at this site. Choose different settings.")
+        if continuation is not None and (folder.exists() or folder.is_symlink()):
+            raise run_conflict(folder)
         if after:
             if not resume_latest or after.parent != folder / "attempts":
                 raise ValueError("A continuation must resume the same run's latest checkpoint")
@@ -190,31 +216,63 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                               key=lambda a: read_json(a / "request.json")["created_at"])
             if after != attempts[-1] or not read_json(after / "status.json").get("scheduler_id"):
                 raise ValueError("Chain predecessor must be the latest submitted Slurm attempt")
-        identity = {"config_hash": config.config_hash, "settings": config.as_dict(),
-                    "executable_sha256": build["executable_sha256"]}
-        if manifest_path.exists():
+        existing = manifest_path.exists()
+        if existing:
             old = read_json(manifest_path)
-            if any(old[k] != v for k, v in identity.items()):
-                raise ValueError("Output belongs to different settings/executable; use another output root")
+            if old["config_hash"] != config.config_hash or old["settings"] != config.as_dict():
+                raise ValueError(f"Run manifest/configuration mismatch: {folder}")
+            saved = Config.read(folder / "config.conf", expected_name=folder.name)
+            if saved.config_hash != config.config_hash:
+                raise ValueError("Saved configuration changed")
             previous_statuses = [attempt_status(a) for a in (folder / "attempts").iterdir()]
+            if checkpoint is None and not resume_latest:
+                if skip_completed and not any(status["state"] in ACTIVE for status in previous_statuses) and completed_run(folder, saved):
+                    return None
+                raise run_conflict(folder, previous_statuses)
             for status in previous_statuses:
                 if status["state"] in ACTIVE and not after:
                     raise RuntimeError(f"An active attempt already exists in {folder / 'attempts'}")
-            if checkpoint is None and not resume_latest and (any("started_at" in s for s in previous_statuses) or
-                                       (folder / "macroData.csv").exists()):
-                raise FileExistsError(f"Run already exists; explicitly resume a checkpoint: {folder}")
-            if Config.read(folder / "config.conf", expected_name=folder.name).config_hash != config.config_hash:
-                raise ValueError("Saved configuration changed")
-            verify_mesh(folder, config)
         else:
-            if folder.exists():
-                raise FileExistsError(f"Unmanaged output directory: {folder}")
+            if folder.exists() or folder.is_symlink():
+                raise run_conflict(folder)
             from .archive import archived_runs
             archived = archived_runs(output_root, {config.config_hash})
             if archived:
-                raise ExpectedError(f"Restore the archived run and rebuild the inventory before launching: {archived[0]['folder']}")
+                archived_folder = Path(archived[0]["folder"])
+                saved = Config.read(archived_folder / "config.conf", expected_name=archived_folder.name)
+                if saved.config_hash != config.config_hash:
+                    raise ValueError(f"Archived manifest/configuration mismatch: {archived_folder}")
+                if skip_completed and completed_run(archived_folder, saved):
+                    return None
+                raise RunConflict(f"Restore the archived run and rebuild the inventory before launching: {archived_folder}")
             if checkpoint is not None or resume_latest:
                 raise ValueError("Resume requires the original managed output folder and configuration")
+            if continuation is None:
+                validate_driven_edge(config.as_dict())
+        executable = retain_executable(executable, Path(state_dir).resolve().parent / "executables")
+        build = executable_identity(executable)
+        if continuation is not None and build.get("execution_interface") != "folder-v1":
+            raise ValueError("Load further requires a current folder-based MTS2D build")
+        if resume_selection is not None and build.get("execution_interface") != "folder-v1":
+            raise ExpectedError("Resume requires a retained build with folder-based checkpoint loading.")
+        if config["initialMeshSha256"] and not supports_initial_mesh(build):
+            raise ExpectedError("Build MTS2D at the execution site to use a custom initial mesh.")
+        if not supports_current_configuration(build):
+            raise ExpectedError("Build MTS2D at the execution site to use the current configuration.")
+        if (config["reconnectionMethod"] == "delaunay" and
+                (config["boundary"] not in {"periodic", "periodicAnchored"} or
+                 config["initialMeshSha256"] or min(config["rows"], config["cols"]) < 3) and
+                not build.get("constrained_delaunay")):
+            raise ExpectedError("Rebuild MTS2D at the execution site to use Delaunay with these mesh options.")
+        from .campaign import record_executable
+        record_executable(campaign, site, executable)
+        identity = {"config_hash": config.config_hash, "settings": config.as_dict(),
+                    "executable_sha256": build["executable_sha256"]}
+        if existing:
+            if old["executable_sha256"] != identity["executable_sha256"]:
+                raise ValueError("Output belongs to a different executable; use another output root")
+            verify_mesh(folder, config)
+        else:
             manifest = identity | {"format": 1, "created_at": now(), "campaign": campaign, "build": build}
             if continuation is not None:
                 from .continuation import stage

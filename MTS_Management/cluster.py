@@ -25,7 +25,7 @@ from .inventory import inventory, rebuild_index, remove_missing, resources
 from .inventory_cache import export as export_inventory, snapshot as cached_inventory
 from .journal import Journal
 from .provenance import build, install_source, source_archive, source_files, source_identity, executable_identity
-from .runner import PACKAGE_ROOT, attempt_log_tail, launch, prepare, stop
+from .runner import PACKAGE_ROOT, RunConflict, attempt_log_tail, find_fresh_conflict, launch, prepare, stop
 
 
 @dataclass
@@ -207,6 +207,16 @@ def serve(payload, *, cancel=None, log=None):
     if op == "mesh_preview":
         from .initial_mesh import preview
         return {"vtu": preview(p["executable"], Config.saved(options["settings"]))}
+    if op == "run_template":
+        from .run_template import read_template
+        selection = options["selection"]
+        folder = Path(selection["folder"])
+        if folder.parent != Path(p["output_root"]):
+            raise ExpectedError("Select a run in the execution site's output root.")
+        return read_template(folder, selection)
+    if op == "run_conflict":
+        config = Config(**options["settings"])
+        return {"conflict": find_fresh_conflict(p["output_root"], config, options.get("label"))}
     if op == "resume":
         from .continuation import source_run
         from .errors import ExpectedError
@@ -239,9 +249,16 @@ def serve(payload, *, cancel=None, log=None):
             if i:
                 options.update(checkpoint="latest", after=jobs[-1]["attempt"])
                 options.pop("initial_mesh", None)
-            attempt = prepare(config, executable=p["executable"], output_root=p["output_root"],
-                              state_dir=p["state_dir"], site=site.name,
-                              environment=site.environment, log=log, **options)
+            try:
+                attempt = prepare(config, executable=p["executable"], output_root=p["output_root"],
+                                  state_dir=p["state_dir"], site=site.name,
+                                  environment=site.environment, log=log, **options)
+            except RunConflict as error:
+                if i or not options.get("skip_completed"):
+                    raise
+                return {"conflict": str(error), "label": options.get("label"), "config_hash": config.config_hash}
+            if attempt is None:
+                return {"skipped": True, "label": options.get("label"), "config_hash": config.config_hash}
             jobs.append(launch(attempt, mode=mode, slurm=slurm, setup=site.setup))
         return jobs[0] if chain == 1 else {"jobs": jobs}
     if op in {"stop", "logs"}:
@@ -408,20 +425,28 @@ def synchronized_snapshot(sites, state_dir, *, operation="snapshot", **options):
 
 
 def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=None, chain=1,
-           initial_mesh=None):
+           initial_mesh=None, skip_completed=False):
     journal = Journal(state_dir)
     submission = journal.append("submission_requested", site=site.name,
                                 config_hash=config.config_hash, campaign=campaign,
                                 label=label, requested_output_root=site.output_root, chain=chain)
     try:
         mesh_input = {"initial_mesh": initial_mesh} if initial_mesh is not None else {}
+        if skip_completed:
+            mesh_input["skip_completed"] = True
         result = call(site, "run", settings=config.as_dict(), campaign=campaign,
                       label=label, checkpoint=checkpoint, chain=chain, **mesh_input)
     except Exception as error:
         journal.append("submission_error", submission_id=submission["event_id"],
                        site=site.name, config_hash=config.config_hash, campaign=campaign,
                        error=str(error), outcome="unknown; inspect remote journal before retrying")
+        if skip_completed and "unexpected keyword argument 'skip_completed'" in str(error):
+            raise ExpectedError(f"Update MTSManager on {site.name} to skip completed campaign members.") from error
         raise
+    if result.get("skipped") or result.get("conflict"):
+        journal.append("submission_skipped" if result.get("skipped") else "submission_conflict",
+                       submission_id=submission["event_id"], site=site.name, campaign=campaign, **result)
+        return result
     journal.append("submission_accepted", submission_id=submission["event_id"],
                    site=site.name, config_hash=config.config_hash, campaign=campaign, **result)
     for job in result.get("jobs", [result]):

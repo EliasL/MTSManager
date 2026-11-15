@@ -59,8 +59,6 @@ class Config:
         if v["initialMeshSha256"]:
             if not re.fullmatch(r"[a-f0-9]{64}", v["initialMeshSha256"]):
                 raise ValueError("initialMeshSha256 must be a lowercase SHA-256 checksum")
-            if v["reconnectionMethod"] == "delaunay":
-                raise ValueError("Use None or Edge flip reconnection for a custom initial mesh")
         choices = {
             "stopWhen": {"all", "any"},
             "loading": {"relaxation", "reversibility", "noRelaxation"},
@@ -159,9 +157,6 @@ class Config:
         if v["deformation"] not in {"compression", "tension"} or min(v["rows"], v["cols"]) < 2:
             raise ValueError("Rectangle boundary displacement requires compression or tension "
                              "on a mesh of at least 2 by 2 nodes")
-        if v["reconnectionMethod"] == "delaunay":
-            raise ValueError("Delaunay reconnection requires periodic boundaries. "
-                             "Use edgeFlip or none for a rectangle")
         driven = v["drivenEdge"]
         if driven not in RECTANGLE_EDGES:
             raise ValueError("drivenEdge must be top, bottom, left, or right")
@@ -193,7 +188,7 @@ class Config:
                 raise ValueError("Indenter settings and fixedBottom require nanoindentation")
             return
         if (v["boundary"] != "fixedBottom" or min(v["rows"], v["cols"]) < 2 or
-                v["loading"] != "relaxation" or v["reconnectionMethod"] == "delaunay" or
+                v["loading"] != "relaxation" or
                 v["segmentLoad"] != 0 or v["repeat"]):
             raise ValueError("Nanoindentation requires bottom fixation, relaxation, at least two rows and "
                              "columns, and an unsegmented loading path")

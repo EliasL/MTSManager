@@ -14,7 +14,7 @@ from .config import Config, sweep
 from .errors import EXPECTED_ERROR_EXIT, EXPECTED_ERROR_FORMAT, ExpectedError
 from .files import read_json, write_json
 from .journal import Journal
-from .runner import execute, launch, prepare, run_many
+from .runner import RunConflict, execute, launch, prepare, run_many
 from .status import render, watch
 
 
@@ -229,27 +229,41 @@ def _run_command(argv):
             entries = [(config, label)]
         if not site.ssh and site.mode == "foreground":
             p = paths(site)
-            attempts = []
+            attempts, skipped, conflicts = [], [], []
             try:
                 for config, label in entries:
-                    attempts.append(prepare(config, executable=p["executable"], output_root=p["output_root"],
-                        state_dir=p["state_dir"], campaign=campaign, label=label,
-                        checkpoint=args.checkpoint if args.command == "run" else None, site=site.name,
-                        environment=site.environment, initial_mesh=initial_mesh))
+                    try:
+                        attempt = prepare(config, executable=p["executable"], output_root=p["output_root"],
+                            state_dir=p["state_dir"], campaign=campaign, label=label,
+                            checkpoint=args.checkpoint if args.command == "run" else None, site=site.name,
+                            environment=site.environment, initial_mesh=initial_mesh,
+                            skip_completed=args.command == "campaign")
+                    except RunConflict as error:
+                        if args.command == "run":
+                            raise
+                        conflicts.append({"label": label, "config_hash": config.config_hash,
+                                          "conflict": str(error)})
+                        continue
+                    if attempt is None:
+                        skipped.append({"label": label, "config_hash": config.config_hash})
+                    else:
+                        attempts.append(attempt)
             except BaseException:
                 from .runner import set_status
                 for attempt in attempts:
                     set_status(attempt, "stopped", reason="Batch preparation failed")
                 raise
-            if len(attempts) == 1:
+            if args.command == "run":
                 result = launch(attempts[0])
             else:
-                run_many(attempts, args.workers)
-                result = {"attempts": list(map(str, attempts))}
+                if attempts:
+                    run_many(attempts, args.workers)
+                result = {"attempts": list(map(str, attempts)), "skipped": skipped, "conflicts": conflicts}
         else:
             result = [submit(replace(site, slurm=site.slurm | resource_plan.get(str(config["rows"]), {})), config, state_dir=state_dir, campaign=campaign, label=label,
                              checkpoint=args.checkpoint if args.command == "run" else None,
-                             chain=args.chain, initial_mesh=initial_mesh)
+                             chain=args.chain, initial_mesh=initial_mesh,
+                             skip_completed=args.command == "campaign")
                       for config, label in entries]
     elif args.command == "deploy":
         result = deploy(site, include_source=args.source is not None, local_source=args.source)

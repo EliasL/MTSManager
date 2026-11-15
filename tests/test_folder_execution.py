@@ -146,6 +146,29 @@ class CheckpointSelectionTests(unittest.TestCase):
 
 @unittest.skipUnless(BINARY.exists(), 'Build MTS2D before simulator lifecycle tests')
 class FolderExecutionTests(unittest.TestCase):
+    def test_campaign_skips_completed_run_and_manual_removal_allows_fresh_start(self):
+        from MTS_Management.errors import ExpectedError
+        from MTS_Management.runner import find_fresh_conflict
+
+        with prepared_run() as (root, config, options):
+            attempt = prepare(config, **options, label="First")
+            launch(attempt)
+            run = attempt.parents[1]
+            self.assertIsNone(prepare(config, **(options | {"executable": root / "other-build"}),
+                                      label="Second", skip_completed=True))
+            self.assertEqual(list((run / "attempts").iterdir()), [attempt])
+            self.assertIn(str(run), find_fresh_conflict(options["output_root"], config, "Second"))
+            site = Site(name="local", directory=str(root), executable=str(root / "other-build"))
+            result = serve({"site": asdict(site), "operation": "run",
+                            "options": {"settings": config.as_dict(), "skip_completed": True}})
+            self.assertTrue(result["skipped"])
+            with self.assertRaisesRegex(ExpectedError, "manually remove the existing folder"):
+                prepare(config, **options, label="Second")
+            run.rename(root / "removed")
+            self.assertEqual(find_fresh_conflict(options["output_root"], config, "Second"), "")
+            new = prepare(config, **options, label="Second")
+            self.assertTrue(new.parents[1].name.startswith("Second["))
+
     def test_custom_periodic_mesh_keeps_cut_and_restored_diagonal(self):
         from MTS_Management.continuation import plan
         from MTS_Management.initial_mesh import preview
