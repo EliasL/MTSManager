@@ -26,7 +26,7 @@
   "dtMax": 0.30000000000000004,
   "dtMin": 1e-07,
   "dtStart": 0.1,
-  "energyDropThreshold": 0.001,
+  "energyDropThreshold": 0.01,
   "energyFunction": "contiSquare",
   "eps": 1e-20,
   "epsR": 1e-05,
@@ -79,7 +79,7 @@
   "top": "free",
   "totalLoad": 1.0,
   "writeDebugVTUs": false,
-  "vtuFilesPerUnitLoad": 100.0,
+  "vtuFilesPerUnitLoad": 30.0,
   "writeDumps": true,
   "writeMeshVTUs": true
 }
