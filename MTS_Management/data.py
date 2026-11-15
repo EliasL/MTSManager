@@ -13,12 +13,13 @@ from .files import digest
 MESH_SNAPSHOT = re.compile(r".*_load=(?P<load>[-+\d.eE]+)_nrM=(?P<plastic>\d+)_\.(?P<step>\d+)\.vtu")
 
 
-def mesh_snapshots(folder):
+def mesh_snapshots(folder, *, through_step=None):
     """List native accepted-state snapshots in load-step order."""
     frames = []
     for path in (Path(folder) / "data").glob("*.vtu"):
         match = MESH_SNAPSHOT.fullmatch(path.name)
-        if match and path.is_file() and not path.is_symlink():
+        if (match and (through_step is None or int(match["step"]) <= through_step)
+                and path.is_file() and not path.is_symlink()):
             frames.append({"name": path.name, "step": int(match["step"]), "load": float(match["load"])})
     frames.sort(key=lambda frame: frame["step"])
     if len({frame["step"] for frame in frames}) != len(frames):
@@ -62,6 +63,37 @@ def plot_seed_group(output_root, folder, manifest_sha256):
 def macro_reader(stream, *, allow_incomplete_tail=False):
     lines = (line for line in stream if line.endswith("\n")) if allow_incomplete_tail else stream
     return csv.DictReader(lines)
+
+
+def last_macro_row(path, *, limit=65536):
+    """Read the last complete native macro row with bounded I/O."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    with path.open("rb") as stream:
+        first = stream.readline(limit)
+        if not first.endswith(b"\n"):
+            raise ValueError(f"Missing/big CSV header: {path}")
+        header = next(csv.reader([first.decode().strip()]))
+        if "load" not in header or len(set(header)) != len(header):
+            raise ValueError(f"Invalid current CSV header: {path}")
+        stream.seek(0, 2)
+        offset = max(len(first), stream.tell() - limit)
+        if offset > len(first):
+            stream.seek(offset - 1)
+            if stream.read(1) != b"\n":
+                stream.readline()  # Discard a partial first row.
+        else:
+            stream.seek(offset)
+        tail = stream.read(limit)
+    for line in reversed(tail.split(b"\n")[:-1]):
+        if not line.strip() or line.startswith(b"#"):
+            continue
+        row = next(csv.reader([line.decode()]))
+        if len(row) != len(header):
+            raise ValueError(f"Malformed complete CSV row: {path}")
+        return dict(zip(header, row))
+    return None
 
 
 def read_macros(path, *, allow_incomplete_tail=False):

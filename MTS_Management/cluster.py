@@ -1,9 +1,11 @@
 """OpenSSH transport; the same installed package handles work on each host."""
 
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
 import getpass
 import json
+import os
 import posixpath
 from pathlib import Path
 import re
@@ -120,7 +122,7 @@ def scheduler_jobs():
     return rows
 
 
-def serve(payload, *, cancel=None):
+def serve(payload, *, cancel=None, log=None):
     """One request per process. Stdout is reserved for the JSON response."""
     site = Site(**payload["site"])
     p = paths(site)
@@ -148,6 +150,13 @@ def serve(payload, *, cancel=None):
         from .errors import ExpectedError
         try:
             return {"runs": plot_seed_group(p["output_root"], **options)}
+        except ExpectedError as error:
+            return {"error": str(error)}
+    if op == "continuation_plan":
+        from .continuation import plan
+        from .errors import ExpectedError
+        try:
+            return plan(p["output_root"], options["selection"])
         except ExpectedError as error:
             return {"error": str(error)}
     if op in {"archive", "restore"}:
@@ -208,7 +217,7 @@ def serve(payload, *, cancel=None):
                 options.update(checkpoint="latest", after=jobs[-1]["attempt"])
             attempt = prepare(config, executable=p["executable"], output_root=p["output_root"],
                               state_dir=p["state_dir"], site=site.name,
-                              environment=site.environment, **options)
+                              environment=site.environment, log=log, **options)
             jobs.append(launch(attempt, mode=mode, slurm=slurm, setup=site.setup))
         return jobs[0] if chain == 1 else {"jobs": jobs}
     if op in {"stop", "logs"}:
@@ -244,7 +253,7 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, *
     if cancel is not None and cancel.is_set():
         raise CancelledError("Operation aborted")
     if not site.ssh and not site.setup and _program is None:
-        return serve(payload, cancel=cancel)
+        return serve(payload, cancel=cancel, log=log)
     python = [site.python, '-u', '-m', module, '_serve']
     if _program is not None:
         python = [site.python, '-u', '-c', "import json,sys; __mts_control_request=json.load(sys.stdin); exec(__mts_control_request.pop('program'))"]
@@ -269,13 +278,40 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, *
     started = time.monotonic()
     # Polling communicate() with input=None after a timeout can leave a large
     # request only partly written. A file supplies the complete request and EOF.
-    with tempfile.TemporaryFile() as request:
+    with ExitStack() as files:
+        request = files.enter_context(tempfile.TemporaryFile())
         request.write(canonical(payload))
         request.seek(0)
+        progress = (files.enter_context(tempfile.TemporaryFile())
+                    if log and operation == "run" and options.get("continuation") else None)
+        offset = 0
+        pending = b""
+
+        def report_progress(*, final=False):
+            nonlocal offset, pending
+            if progress is None:
+                return
+            # Read without moving the remote process's write position.
+            while block := os.pread(progress.fileno(), 65536, offset):
+                offset += len(block)
+                *lines, pending = (pending + block).split(b"\n")
+                for line in lines:
+                    log(line.decode(errors="replace"))
+            if final and pending:
+                log(pending.decode(errors="replace"))
+
+        def collect_stderr(stderr):
+            if progress is None:
+                return stderr
+            report_progress(final=True)
+            progress.seek(0)
+            return progress.read().decode(errors="replace")
+
         with subprocess.Popen(args, stdin=request, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True) as process:
+                              stderr=progress if progress is not None else subprocess.PIPE, text=True) as process:
             try:
                 while True:
+                    report_progress()
                     if cancel is not None and cancel.is_set():
                         raise CancelledError("Operation aborted; previous cached inventory retained")
                     if time.monotonic() - started >= timeout:
@@ -292,10 +328,12 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, *
                 except subprocess.TimeoutExpired:
                     process.kill()
                     stdout, stderr = process.communicate()
+                stderr = collect_stderr(stderr)
                 if isinstance(error, subprocess.TimeoutExpired):
                     error.output, error.stderr = stdout, stderr
                 raise
-            if log and stderr.strip():
+            stderr = collect_stderr(stderr)
+            if log and progress is None and stderr.strip():
                 log(stderr.rstrip())
             if process.returncode:
                 if reader and process.returncode in {-14, 142}:
@@ -528,6 +566,8 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     if mesh_frames is not None:
         name = Path(rows[0]["folder"]).name
         files = [f"{name}/{entry}\n" for entry in ("config.conf", "manifest.json")]
+        if rows[0].get("progress", {}).get("csv_modified") is not None:
+            files.append(f"{name}/macroData.csv\n")
         files.extend(f"{name}/data/{frame}\n" for frame in mesh_frames)
         filters = []
     with tempfile.TemporaryDirectory() as temporary:

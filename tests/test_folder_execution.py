@@ -16,7 +16,7 @@ import io
 
 from MTS_Management.campaign import campaign_entries
 from MTS_Management.cluster import Site, serve
-from MTS_Management.data import read_macros
+from MTS_Management.data import mesh_snapshots, read_macros
 from MTS_Management.inventory import inventory
 from MTS_Management.config import Config
 from MTS_Management.files import file_digest, read_json, write_json
@@ -123,8 +123,117 @@ def physical_rows(folder):
     return [tuple(row[key] for key in columns) for row in read_macros(folder/'macroData.csv')]
 
 
+class CheckpointSelectionTests(unittest.TestCase):
+    def test_defunct_launcher_does_not_block_continuation(self):
+        from MTS_Management.archive import check_inactive
+        from MTS_Management.errors import ExpectedError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            attempt = folder / "attempts" / "attempt"
+            attempt.mkdir(parents=True)
+            started = "Sun Nov 15 14:51:49 2026"
+            write_json(attempt / "status.json", {"state": "prepared", "launcher_pid": 123, "launcher_token": started})
+            write_json(attempt / "request.json", {"command": ["MTS2D"]})
+            (attempt / "exitcode").write_text("0\n")
+
+            def process_listing(state):
+                def run(command, **kwargs):
+                    fields = {"stat=": state, "lstart=": started}
+                    return subprocess.CompletedProcess(command, 0, " ".join(fields[key] for key in command[4::2]) + "\n")
+                return run
+
+            with patch("MTS_Management.runner.subprocess.run", side_effect=process_listing("Z")):
+                check_inactive(folder)
+            with patch("MTS_Management.runner.subprocess.run", side_effect=process_listing("S")):
+                with self.assertRaises(ExpectedError):
+                    check_inactive(folder)
+
+    def test_rounded_final_dump_and_rotating_slots_skip_provably_older_files(self):
+        from MTS_Management.continuation import checkpoint_files, latest_checkpoint
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary)
+            dumps = run / "dumps"
+            dumps.mkdir()
+            for name, step, load in (
+                ("dump_l0.8", 12, .81), ("dump_l0.88", 19, .879), ("dump_l1.04", 31, 1.04),
+                ("dump_l1.0", 32, 1.049), ("checkpoint_0", 28, .985), ("checkpoint_1", 30, 1.03),
+            ):
+                with gzip.open(dumps / (name + ".xml.gz"), "wt") as output:
+                    output.write(f"<cereal><Simulation><mesh><load>{load}</load><loadSteps>{step}</loadSteps>"
+                                 "</mesh></Simulation></cereal>")
+
+            checkpoint, earlier, checked = latest_checkpoint(checkpoint_files(run), last_load=1.049)
+            self.assertEqual((checkpoint["name"], checkpoint["step"]), ("dump_l1.0.xml.gz", 32))
+            self.assertEqual(checked, 3)
+            self.assertEqual({path.name for path in earlier}, {path.name for path in dumps.iterdir()} - {checkpoint["name"]})
+
+            # A larger printed load can describe an earlier step when the
+            # files were written with different decimal precisions.
+            with gzip.open(dumps / "dump_l1.05.xml.gz", "wt") as output:
+                output.write("<cereal><Simulation><mesh><load>1.046</load><loadSteps>31</loadSteps>"
+                             "</mesh></Simulation></cereal>")
+            (dumps / "dump_l1.04.xml.gz").unlink()
+            checkpoint, _, checked = latest_checkpoint(checkpoint_files(run), last_load=1.049)
+            self.assertEqual((checkpoint["name"], checkpoint["step"]), ("dump_l1.0.xml.gz", 32))
+            self.assertEqual(checked, 4)
+
+
 @unittest.skipUnless(BINARY.exists(), 'Build MTS2D before simulator lifecycle tests')
 class FolderExecutionTests(unittest.TestCase):
+    def test_load_further_copies_only_history_through_checkpoint(self):
+        from MTS_Management.continuation import plan
+
+        with prepared_run(startLoad=0., writeDumps=False, writeMeshVTUs=True,
+                          nrVTUFrames=100) as (_, config, options):
+            original_attempt = prepare(config, **options)
+            launch(original_attempt)
+            source = original_attempt.parents[1]
+            original_csv = (source / "macroData.csv").read_bytes()
+            source_manifest = source / "manifest.json"
+            selection = {"folder": str(source), "config_hash": config.config_hash,
+                         "manifest_sha256": file_digest(source_manifest)}
+            with patch("MTS_Management.continuation.checkpoint_location",
+                       side_effect=AssertionError("Review opened a compressed checkpoint")):
+                reviewed = plan(options["output_root"], selection)
+            self.assertAlmostEqual(reviewed["settings"]["totalLoad"], 1.004)
+            self.assertEqual(set(options["output_root"].resolve().glob("*/manifest.json")), {source_manifest})
+            checksum = file_digest(source / "dumps" / "checkpoint_0.xml.gz")
+
+            edited = Config(**(reviewed["settings"] | {"totalLoad": .006, "loadIncrement": .0005,
+                                                      "checkpointInterval": 4}))
+            messages = []
+            receipt = selection | {"checkpoint_catalog": reviewed["checkpoint_catalog"]}
+            attempt = prepare(edited, **options, continuation=receipt, log=messages.append)
+            progress = [int(line.rsplit(" ", 1)[-1][:-1]) for line in messages if line.startswith("Copying original simulation")]
+            self.assertEqual(progress, sorted(set(progress)))
+            self.assertEqual((progress[0], progress[-1]), (0, 100))
+            self.assertGreater(len(progress), 2)
+            destination = attempt.parents[1]
+            self.assertNotEqual(destination, source)
+            record = read_json(destination / "manifest.json")["continuation"]
+            self.assertEqual(record["checkpoint"]["step"], 4)
+            self.assertAlmostEqual(record["checkpoint"]["load"], .003)
+            # Before the first new step the solver writes the same slot.
+            self.assertEqual(file_digest(destination / "dumps" / "checkpoint_1.xml.gz"), checksum)
+            self.assertEqual(physical_rows(destination), physical_rows(source)[:4])
+            copied = mesh_snapshots(destination)
+            self.assertEqual([frame["step"] for frame in copied], [2, 3, 4])
+            for frame in copied:
+                self.assertEqual(file_digest(destination / "data" / frame["name"]),
+                                 file_digest(source / "data" / frame["name"]))
+            self.assertFalse((destination / "termination.json").exists())
+
+            launch(attempt)
+            final = physical_rows(destination)
+            self.assertEqual(final[:4], physical_rows(source)[:4])
+            self.assertAlmostEqual(float(final[4][1]), .0035)
+            self.assertAlmostEqual(float(final[-1][1]), .006)
+            self.assertEqual((source / "macroData.csv").read_bytes(), original_csv)
+            saved = destination / record["saved_checkpoint"]
+            self.assertEqual(file_digest(saved), checksum)
+
     def test_direct_resume_matches_uninterrupted_output_and_original_binary(self):
         with prepared_run() as (root, config, options):
             attempt = prepare(config, **options)

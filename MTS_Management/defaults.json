@@ -35,6 +35,8 @@
   "finc": 1.1,
   "forceReRun": false,
   "fullMinimizationLogging": false,
+  "indentationContact": "penalty",
+  "indenterRadius": 25.0,
   "initialGuessNoise": 0.05,
   "left": "free",
   "loadIncrement": 0.1,

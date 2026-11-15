@@ -8,6 +8,7 @@ import signal
 import socket
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import threading
 import time
 import uuid
@@ -16,7 +17,9 @@ from .config import Config
 from .files import digest, file_digest, locked, now, read_json, write_json
 from .journal import Journal
 from .inventory_cache import invalidate as invalidate_inventory
-from .provenance import executable_identity, scripts_identity, retain_executable, supports_rectangle_boundary
+from .provenance import (
+    executable_identity, scripts_identity, retain_executable, supports_indentation, supports_rectangle_boundary,
+)
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 ACTIVE = {"prepared", "queued", "running", "stopping"}
@@ -24,9 +27,12 @@ _PRINT_LOCK = threading.Lock()
 
 
 def process_token(pid):
-    result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+    result = subprocess.run(["ps", "-p", str(pid), "-o", "stat=", "-o", "lstart="],
                             capture_output=True, text=True, check=False)
-    return result.stdout.strip() if result.returncode == 0 else None
+    if result.returncode != 0:
+        return None
+    state, started = result.stdout.strip().split(maxsplit=1)
+    return None if state.startswith("Z") else started
 
 
 def python_command(*args):
@@ -70,13 +76,16 @@ def attempt_status(attempt):
                           "REQUEUED": "queued"}
                 return status | {"state": mapped.get(state, "failed"), "scheduler_state": state}
     elif status.get("launcher_pid"):
-        alive = process_token(status["launcher_pid"]) == status.get("launcher_token")
+        token = status.get("launcher_token")
+        alive = bool(token) and process_token(status["launcher_pid"]) == token
         return status | {"state": "running" if alive else ("stopped" if status["state"] == "stopped" else "unknown"), "process_alive": alive}
     return status
 
 
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
-            checkpoint=None, site="local", environment=None, after=None):
+            checkpoint=None, site="local", environment=None, after=None, continuation=None, log=None):
+    if continuation is not None and (checkpoint or after):
+        raise ValueError("Choose either a new continuation folder or an existing run to resume")
     if checkpoint:
         root = Path(output_root).resolve()
         index_path = root / ".run-index.json"
@@ -88,8 +97,12 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                 executable = max(requests, key=lambda r: r["created_at"])["executable"]
     executable = retain_executable(executable, Path(state_dir).resolve().parent / "executables")
     build = executable_identity(executable)
+    if continuation is not None and build.get("execution_interface") != "folder-v1":
+        raise ValueError("Load further requires a current folder-based MTS2D build")
     if config["boundary"] == "rectangle" and not supports_rectangle_boundary(build):
         raise ValueError("Build MTS2D at the execution site to use rectangle boundary displacement")
+    if config["deformation"] == "nanoindentation" and not supports_indentation(build):
+        raise ValueError("Build MTS2D at the execution site to use nanoindentation")
     from .campaign import record_executable
     record_executable(campaign, site, executable)
     output_root = Path(output_root).resolve()
@@ -111,6 +124,8 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         if matches:
             folder = output_root / matches[0]
         manifest_path = folder / "manifest.json"
+        if continuation is not None and (matches or folder.exists() or folder.is_symlink()):
+            raise ValueError("A run with these settings already exists at this site. Choose different settings.")
         if after:
             if not resume_latest or after.parent != folder / "attempts":
                 raise ValueError("A continuation must resume the same run's latest checkpoint")
@@ -143,17 +158,32 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                 raise ExpectedError(f"Restore the archived run and rebuild the inventory before launching: {archived[0]['folder']}")
             if checkpoint is not None or resume_latest:
                 raise ValueError("Resume requires the original managed output folder and configuration")
-            folder.mkdir()
-            (folder / "config.conf").write_text(config.text(folder.name))
-            write_json(manifest_path, identity | {"format": 1, "created_at": now(),
-                       "campaign": campaign, "build": build})
+            manifest = identity | {"format": 1, "created_at": now(), "campaign": campaign, "build": build}
+            if continuation is not None:
+                from .continuation import stage
+                with TemporaryDirectory(prefix=".continuation-", dir=output_root) as temporary:
+                    staged = Path(temporary) / folder.name
+                    staged.mkdir()
+                    record = stage(output_root, staged, config, continuation, log=log or print)
+                    (staged / "config.conf").write_text(config.text(folder.name))
+                    write_json(staged / "manifest.json", manifest | {"continuation": record})
+                    staged.rename(folder)
+                checkpoint = folder / record["saved_checkpoint"]
+                resume_latest = True
+            else:
+                folder.mkdir()
+                (folder / "config.conf").write_text(config.text(folder.name))
+                write_json(manifest_path, manifest)
         if checkpoint and not checkpoint.is_relative_to(folder):
             raise ValueError("Resume checkpoint must belong to this run")
         invalidate_inventory(output_root, config.config_hash)
         attempt_id = uuid.uuid4().hex
         attempt = folder / "attempts" / attempt_id
         attempt.mkdir(parents=True)
-        inputs = {"checkpoint": str(checkpoint), "sha256": file_digest(checkpoint)} if checkpoint else None
+        inputs = None
+        if checkpoint:
+            checksum = record["checkpoint"]["sha256"] if continuation is not None else file_digest(checkpoint)
+            inputs = {"checkpoint": str(checkpoint), "sha256": checksum}
         run_identity = digest({"config": config.config_hash, "executable": build["executable_sha256"],
                                "input": inputs["sha256"] if inputs else None})
         request = {"attempt_id": attempt_id, "run_identity": run_identity,
@@ -166,7 +196,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                    "created_at": now()}
         if build.get("execution_interface") == "folder-v1":
             command = [str(executable), str(folder), "--resume"]
-            if inputs:
+            if inputs and continuation is None:
                 command = [str(executable), "-c", str(folder / "config.conf"),
                            "-o", str(folder.parent), "-d", inputs["checkpoint"]]
             request.update(command=command, cwd=str(folder),
@@ -426,7 +456,8 @@ def stop(attempt):
                     raise RuntimeError(f"Cannot cancel/confirm job state: {cancelled.stderr}")
                 status["scheduler_terminal_state"] = observed
         elif read_json(attempt / "request.json").get("command"):
-            if status.get("launcher_pid") and process_token(status["launcher_pid"]) == status.get("launcher_token"):
+            token = status.get("launcher_token")
+            if status.get("launcher_pid") and token and process_token(status["launcher_pid"]) == token:
                 os.killpg(status["launcher_pid"], signal.SIGTERM)
         elif status["state"] == "running":
             if (not status.get("runner_token") or

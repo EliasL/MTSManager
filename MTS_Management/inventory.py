@@ -1,6 +1,5 @@
 """Indexed run discovery and bounded progress/storage inspection."""
 
-import csv
 from concurrent.futures import CancelledError
 from collections import deque
 import math
@@ -10,6 +9,7 @@ import shutil
 import time
 
 from .config import Config
+from .data import last_macro_row
 
 from .files import file_digest, locked, now, read_json, write_json
 from .inventory_cache import invalidate, publish, records
@@ -22,38 +22,17 @@ def config_metadata_stamp():
 
 def progress(folder, config, limit=65536):
     path = Path(folder) / "macroData.csv"
-    if not path.exists():
+    values = last_macro_row(path, limit=limit)
+    if values is None:
         return {"load": None, "fraction": None}
-    with path.open("rb") as stream:
-        first = stream.readline(limit)
-        if not first.endswith(b"\n"):
-            raise ValueError(f"Missing/big CSV header: {path}")
-        header = next(csv.reader([first.decode().strip()]))
-        if "load" not in header or len(set(header)) != len(header):
-            raise ValueError(f"Invalid current CSV header: {path}")
-        stream.seek(0, 2)
-        offset = max(len(first), stream.tell() - limit)
-        stream.seek(offset)
-        if offset > len(first):
-            stream.readline()  # discard the partial first row
-        tail = stream.read(limit)
-    lines = tail.split(b"\n")[:-1]  # ignore a row still being written
-    for line in reversed(lines):
-        if not line.strip() or line.startswith(b"#"):
-            continue
-        row = next(csv.reader([line.decode()]))
-        if len(row) != len(header):
-            raise ValueError(f"Malformed complete CSV row: {path}")
-        values = dict(zip(header, row))
-        load = float(values["load"])
-        if not math.isfinite(load):
-            raise ValueError(f"Non-finite load: {path}")
-        fraction = ((load-config["startLoad"])/config["totalLoad"]
-                    if config["totalLoad"] else 1.0)
-        return {"load": load, "fraction": min(1.0, max(0.0, fraction)),
-                "csv_modified": path.stat().st_mtime,
-                "estimated_remaining": values.get("est_time_remaining")}
-    return {"load": None, "fraction": None}
+    load = float(values["load"])
+    if not math.isfinite(load):
+        raise ValueError(f"Non-finite load: {path}")
+    fraction = ((load-config["startLoad"])/config["totalLoad"]
+                if config["totalLoad"] else 1.0)
+    return {"load": load, "fraction": min(1.0, max(0.0, fraction)),
+            "csv_modified": path.stat().st_mtime,
+            "estimated_remaining": values.get("est_time_remaining")}
 
 
 def estimate_size(folder, *, max_entries=10000, seconds=0.2, samples=5):

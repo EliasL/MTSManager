@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 
-from .config import DEFAULTS
+from .config import DEFAULTS, INDENTATION_SETTINGS
 from .files import digest, file_digest, read_json, write_json, now, locked
 
 
@@ -257,4 +257,9 @@ def executable_identity(executable):
 
 
 def supports_rectangle_boundary(build):
+    return (supports_indentation(build) or
+            build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS.keys() - INDENTATION_SETTINGS)))
+
+
+def supports_indentation(build):
     return build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS))

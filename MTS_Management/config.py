@@ -13,6 +13,7 @@ DEFAULTS = json.loads(Path(__file__).with_name("defaults.json").read_text())
 SCHEMA_REVISION = "23e61580faa0c3a4d6c0ca7d730dfbe00d1da95f"
 RECTANGLE_EDGES = ("top", "bottom", "left", "right")
 RECTANGLE_SETTINGS = {"drivenEdge", *RECTANGLE_EDGES}
+INDENTATION_SETTINGS = {"indenterRadius", "indentationContact"}
 
 
 class Config:
@@ -21,6 +22,8 @@ class Config:
         if unknown:
             raise ValueError(f"Unknown current MTS2D settings: {sorted(unknown)}")
         values = DEFAULTS | settings
+        if values["deformation"] == "nanoindentation" and "boundary" not in settings:
+            values["boundary"] = "fixedBottom"
         if values["deformation"] == "sequentialSlip" and isinstance(values["directions"], str):
             for key, value in (("segmentLoad", 1.0), ("totalLoad", values["directions"].count(",") + 1.0)):
                 if key not in settings:
@@ -43,8 +46,10 @@ class Config:
         choices = {
             "stopWhen": {"all", "any"},
             "loading": {"relaxation", "reversibility", "noRelaxation"},
-            "deformation": {"simpleShear", "directDisplacement", "sequentialSlip", "compression", "tension"},
-            "boundary": {"fixed", "periodic", "anchored", "periodicAnchored", "rectangle"},
+            "deformation": {"simpleShear", "directDisplacement", "sequentialSlip", "compression", "tension",
+                            "nanoindentation"},
+            "boundary": {"fixed", "periodic", "anchored", "periodicAnchored", "rectangle", "fixedBottom"},
+            "indentationContact": {"penalty", "projection"},
             "reconnectionMethod": {"none", "edgeFlip", "delaunay"},
             "minimizer": {"LBFGS", "CG", "FIRE"},
             "preconditioner": {"none", "exactTangent", "diagonal"},
@@ -62,6 +67,7 @@ class Config:
             raise ValueError("Invalid loading budget/increment")
         rectangle = v["boundary"] == "rectangle"
         Config._validate_rectangle(v)
+        Config._validate_indentation(v)
         directions = [] if rectangle else "".join(v["directions"].split()).split(",")
         if v["deformation"] == "sequentialSlip":
             if v["boundary"] != "anchored" or min(v["rows"], v["cols"]) < 2:
@@ -155,14 +161,40 @@ class Config:
             raise ValueError("Final compression displacement must be less than "
                              "the initial distance between loaded edges")
 
+    @staticmethod
+    def _validate_indentation(v):
+        if v["deformation"] != "nanoindentation":
+            if v["boundary"] == "fixedBottom" or any(v[key] != DEFAULTS[key] for key in INDENTATION_SETTINGS):
+                raise ValueError("Indenter settings and fixedBottom require nanoindentation")
+            return
+        if (v["boundary"] != "fixedBottom" or min(v["rows"], v["cols"]) < 2 or
+                v["loading"] != "relaxation" or v["reconnectionMethod"] == "delaunay" or
+                v["segmentLoad"] != 0 or v["repeat"]):
+            raise ValueError("Nanoindentation requires bottom fixation, relaxation, at least two rows and "
+                             "columns, and an unsegmented loading path")
+        spacing = math.sqrt(3) / 2 if v["energyFunction"] == "contiTriangular" else 1
+        if (v["indenterRadius"] <= 0 or v["loadIncrement"] <= 0 or v["startLoad"] < 0 or
+                v["startLoad"] + v["totalLoad"] >= (v["rows"] - 1) * spacing):
+            raise ValueError("Nanoindentation requires a positive radius and increment, a nonnegative "
+                             "initial depth, and a final depth below the sample height")
+
     def __getitem__(self, key):
         return self._values[key]
 
     def as_dict(self):
         if hasattr(self, "_original"):
             return dict(self._original)
-        return {key: value for key, value in self._values.items()
-                if self["boundary"] == "rectangle" or key not in RECTANGLE_SETTINGS}
+        excluded = self.inactive_settings(self._values)
+        return {key: value for key, value in self._values.items() if key not in excluded}
+
+    @staticmethod
+    def inactive_settings(values):
+        excluded = set()
+        if values.get("boundary") != "rectangle":
+            excluded.update(RECTANGLE_SETTINGS)
+        if values.get("deformation") != "nanoindentation":
+            excluded.update(INDENTATION_SETTINGS)
+        return excluded
 
     @property
     def config_hash(self):
@@ -190,9 +222,7 @@ class Config:
     @classmethod
     def saved(cls, values, supplement=None):
         """Resolve absent campaign settings without changing the saved identity."""
-        missing = DEFAULTS.keys() - values.keys()
-        if values.get("boundary") != "rectangle":
-            missing -= RECTANGLE_SETTINGS
+        missing = DEFAULTS.keys() - values.keys() - cls.inactive_settings(values)
         if supplement is None:
             supplement = {}
         if missing and not supplement:
