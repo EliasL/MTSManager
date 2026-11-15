@@ -74,9 +74,11 @@ def estimate_size(folder, *, max_entries=10000, seconds=0.2, samples=5):
             "estimated_at": now(), "method": "mean of first files per directory/suffix"}
 
 
-def rebuild_index(output_root):
+def rebuild_index(output_root, *, keep_missing=False):
     root = Path(output_root).resolve()
     with locked(root / ".prepare.lock"):
+        index_file = root / ".run-index.json"
+        previous = read_json(index_file) if keep_missing and index_file.exists() else {}
         index = {}
         for folder in root.iterdir():
             if not folder.is_dir() or not (folder / "manifest.json").exists():
@@ -88,9 +90,35 @@ def rebuild_index(output_root):
             if config.config_hash in index:
                 raise ValueError(f"Duplicate configuration directories: {folder}")
             index[config.config_hash] = folder.name
-        write_json(root / ".run-index.json", index)
-        invalidate(root)
+        for h, name in previous.items():
+            if not (root / name).exists():
+                index.setdefault(h, name)
+        write_json(index_file, index)
+        if not keep_missing:
+            invalidate(root)
     return index
+
+
+def remove_missing(output_root, runs):
+    root = Path(output_root).resolve()
+    index_file = root / ".run-index.json"
+    if not index_file.is_file():
+        return []
+    with locked(root / ".inventory.lock"), locked(root / ".prepare.lock"):
+        index = read_json(index_file)
+        removed = []
+        for run in runs:
+            h = run["config_hash"]
+            if h in index and str(root / index[h]) == run["folder"]:
+                folder = root / index[h]
+                if not folder.exists() and not folder.is_symlink():
+                    del index[h]
+                    removed.append(h)
+        if removed:
+            write_json(index_file, index)
+            for h in removed:
+                invalidate(root, h)
+    return removed
 
 
 def inventory(output_root, *, config_hash=None, config_hashes=None, refresh_sizes=False, hard_refresh=False,
@@ -107,7 +135,7 @@ def inventory(output_root, *, config_hash=None, config_hashes=None, refresh_size
         return []
     index_file = root / ".run-index.json"
     if not index_file.exists() or (hard_refresh and config_hash is None and config_hashes is None):
-        rebuild_index(root)
+        rebuild_index(root, keep_missing=True)
     # Serialise refreshes, without blocking lifecycle invalidation or cached readers.
     with locked(root / ".inventory.lock", cancel=cancel):
         rows = _inventory(root, config_hash=config_hash, config_hashes=config_hashes, refresh_sizes=refresh_sizes,
@@ -135,14 +163,21 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
         if cancel is not None and cancel.is_set():
             raise CancelledError("Inventory aborted")
         folder = root / index[h]
-        if not folder.exists():
+        revision, row = cached.get(h, (0, None))
+        revisions[h] = revision
+        if not folder.exists() and not folder.is_symlink():
             from .archive import ARCHIVE_MARKER, archive_root
             archive = archive_root(root)
             if (archive / ARCHIVE_MARKER).exists() and (archive / folder.name / "manifest.json").is_file():
                 if read_json(archive / folder.name / "manifest.json")["config_hash"] == h:
                     continue
-        revision, row = cached.get(h, (0, None))
-        revisions[h] = revision
+            missing = {"config_hash": h, "folder": str(folder), "attempt": None,
+                       "campaign": (row or {}).get("campaign"), "run_date": (row or {}).get("run_date"),
+                       "status": {"state": "missing"}, "termination": None,
+                       "progress": {"load": None, "fraction": None}, "missing": True}
+            result.append(missing)
+            updates.append(missing)
+            continue
         if (not hard_refresh and not refresh_sizes and row is not None and row["folder"] == str(folder)
                 and "run_date" in row
                 and row["status"]["state"] == "finished" and not row["queued_continuations"]

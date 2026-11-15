@@ -252,7 +252,16 @@ class FolderExecutionTests(unittest.TestCase):
             greatest = max(steps.values())
             for p, step in steps.items():
                 os.utime(p, (100 if step == greatest else 2000000000,)*2)
-            resumed = prepare(config, **(options | {'executable':root/'missing-build'}), checkpoint='latest')
+            # Its name puts this old file strictly before either rotating checkpoint.
+            (folder/'dumps/dump_l-0.100.xml.gz').write_bytes(b'corrupt old dump')
+            (attempt/'exitcode').write_text('1\n')
+            with (attempt/'stdout.log').open('a') as log:
+                log.write('Cannot write VTU file: No space left on device\n')
+            self.assertEqual(inventory(options['output_root'])[0]['status']['failure_reason'], 'storage space')
+            selection = {'folder': str(folder), 'config_hash': config.config_hash,
+                         'manifest_sha256': file_digest(folder/'manifest.json')}
+            resumed = prepare(config, **(options | {'executable':root/'missing-build'}),
+                              checkpoint='latest', resume_selection=selection)
             self.assertEqual(read_json(resumed/'request.json')['executable'], request['executable'])
             launch(resumed)
             self.assertEqual(physical_rows(folder), expected)

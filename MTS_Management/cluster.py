@@ -19,11 +19,11 @@ import tomllib
 
 from .config import Config, DEFAULTS
 from .files import canonical, digest, file_digest, locked, now, read_json, write_json
-from .inventory import inventory, rebuild_index, resources
+from .inventory import inventory, rebuild_index, remove_missing, resources
 from .inventory_cache import export as export_inventory, snapshot as cached_inventory
 from .journal import Journal
 from .provenance import build, install_source, source_archive, source_files, source_identity, executable_identity
-from .runner import PACKAGE_ROOT, launch, prepare, stop
+from .runner import PACKAGE_ROOT, attempt_log_tail, launch, prepare, stop
 
 
 @dataclass
@@ -172,6 +172,8 @@ def serve(payload, *, cancel=None, log=None):
         if options:
             raise ValueError("Cached inventory reads do not accept refresh options")
         return cached_inventory(p["output_root"])
+    if op == "remove_missing":
+        return {"removed": remove_missing(p["output_root"], options["runs"])}
     if op == "inventory_update":
         if "config_hash" in options or "config_hashes" in options:
             raise ValueError("Inventory database export requires a full refresh")
@@ -200,6 +202,22 @@ def serve(payload, *, cancel=None, log=None):
     if op == "build":
         return build(p["source"], Path(p["executable"]).parent,
                      native_arch=site.native_arch, archive_dir=Path(site.directory).resolve() / "executables", **options)
+    if op == "resume":
+        from .continuation import source_run
+        from .errors import ExpectedError
+        root = Path(p["output_root"]).resolve()
+        selection = options["selection"]
+        try:
+            with source_run(root, selection) as (folder, config):
+                campaign = read_json(folder / "manifest.json")["campaign"]
+            attempt = prepare(config, executable=p["executable"], output_root=root,
+                              state_dir=p["state_dir"], site=site.name, environment=site.environment,
+                              campaign=campaign, checkpoint="latest", resume_selection=selection)
+        except ExpectedError as error:
+            return {"error": str(error)}
+        mode = "detached" if site.mode == "foreground" else site.mode
+        slurm = {"cpus-per-task": config["nrThreads"] * site.slurm_cpus_per_thread} | site.slurm
+        return launch(attempt, mode=mode, slurm=slurm, setup=site.setup)
     if op == "run":
         settings = options.pop("settings")
         config = Config.saved(settings)
@@ -227,14 +245,7 @@ def serve(payload, *, cancel=None, log=None):
         if op == "stop":
             stop(attempt)
             return {"attempt": str(attempt), "state": read_json(attempt / "status.json")["state"]}
-        log = attempt / "stdout.log"
-        if not log.exists():
-            log = attempt / "launcher.log"
-        if not log.exists():
-            return "No output yet."
-        with log.open("rb") as stream:
-            stream.seek(max(0, log.stat().st_size-65536))
-            return stream.read(65536).decode(errors="replace")
+        return attempt_log_tail(attempt) or "No output yet."
     raise ValueError(f"Unknown remote operation: {op}")
 
 
@@ -522,7 +533,7 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     available = call(site, "inventory", **options)
     selected = {}
     for prefix in hashes:
-        matches = [r for r in available if r["config_hash"].startswith(prefix)]
+        matches = [r for r in available if r["config_hash"].startswith(prefix) and not r.get("missing")]
         if len(matches) > 1 or (not matches and not completed_only):
             raise ValueError(f"Expected one run for {prefix}; found {len(matches)}")
         if matches and (not completed_only or matches[0].get("termination") is not None):

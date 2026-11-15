@@ -49,7 +49,7 @@
   "minimizer": "LBFGS",
   "minimum_transport_distance": true,
   "nrThreads": 1,
-  "nrVTUFrames": 200,
+  "nrVTUFrames": 100,
   "plasticityEventThreshold": 0.01,
   "preconditioner": "exactTangent",
   "preconditionerDisplacementThreshold": 0.05,

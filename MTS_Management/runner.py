@@ -14,6 +14,7 @@ import time
 import uuid
 
 from .config import Config
+from .errors import ExpectedError
 from .files import digest, file_digest, locked, now, read_json, write_json
 from .journal import Journal
 from .inventory_cache import invalidate as invalidate_inventory
@@ -52,17 +53,40 @@ def cpu_allocation():
             "physical_cores": len(cores)}
 
 
+def attempt_log_tail(attempt):
+    for name in ("stdout.log", "launcher.log"):
+        try:
+            with (attempt / name).open("rb") as stream:
+                stream.seek(max(0, os.fstat(stream.fileno()).st_size - 65536))
+                return stream.read(65536).decode(errors="replace")
+        except FileNotFoundError:
+            continue
+    return ""
+
+
+def failure_status(attempt, status, **fields):
+    reason = None
+    text = (str(status.get("error", "")) + "\n" + attempt_log_tail(attempt)).lower()
+    if any(message in text for message in ("no space left on device", "disk quota exceeded", "enospc")):
+        reason = "storage space"
+    elif fields.get("scheduler_state") == "OUT_OF_MEMORY" or "out of memory" in text or "std::bad_alloc" in text:
+        reason = "out of memory"
+    return status | fields | {"state": "failed", "failure_reason": reason}
+
+
 def attempt_status(attempt):
     """Read both historical worker records and direct process/scheduler evidence."""
     attempt = Path(attempt)
     status = read_json(attempt / "status.json")
     request = read_json(attempt / "request.json")
     if not request.get("command"):
-        return status
+        return failure_status(attempt, status) if status["state"] == "failed" else status
     exitfile = attempt / "exitcode"
-    if exitfile.exists():
-        code = int(exitfile.read_text())
-        return status | {"state": "finished" if code == 0 else "failed", "returncode": code}
+    receipt = exitfile.read_text().strip() if exitfile.exists() else ""
+    if receipt:
+        code = int(receipt)
+        return (failure_status(attempt, status, returncode=code) if code else
+                status | {"state": "finished", "returncode": code})
     if status.get("scheduler_id"):
         result = subprocess.run(["sacct", "-X", "-n", "-P", "-j", status["scheduler_id"],
                                  "--format=JobIDRaw,State,ExitCode"], capture_output=True, text=True, check=True)
@@ -74,24 +98,35 @@ def attempt_status(attempt):
                           "CANCELLED": "stopped", "TIMEOUT": "stopped", "PREEMPTED": "stopped",
                           "COMPLETING": "running", "CONFIGURING": "queued", "SUSPENDED": "running",
                           "REQUEUED": "queued"}
-                return status | {"state": mapped.get(state, "failed"), "scheduler_state": state}
+                if state in SCHEDULER_TERMINAL and state not in mapped:
+                    return failure_status(attempt, status, scheduler_state=state)
+                return status | {"state": mapped.get(state, "unknown"), "scheduler_state": state}
     elif status.get("launcher_pid"):
         token = status.get("launcher_token")
         alive = bool(token) and process_token(status["launcher_pid"]) == token
-        return status | {"state": "running" if alive else ("stopped" if status["state"] == "stopped" else "unknown"), "process_alive": alive}
-    return status
+        if alive:
+            return status | {"state": "running", "process_alive": True}
+        if status["state"] == "stopped":
+            return status | {"process_alive": False}
+        return failure_status(attempt, status, process_alive=False)
+    return failure_status(attempt, status) if status["state"] == "failed" else status
 
 
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
-            checkpoint=None, site="local", environment=None, after=None, continuation=None, log=None):
+            checkpoint=None, site="local", environment=None, after=None, continuation=None,
+            resume_selection=None, log=None):
     if continuation is not None and (checkpoint or after):
         raise ValueError("Choose either a new continuation folder or an existing run to resume")
+    if resume_selection is not None and (checkpoint != "latest" or after):
+        raise ValueError("A selected run must resume from its latest checkpoint")
     if checkpoint:
         root = Path(output_root).resolve()
         index_path = root / ".run-index.json"
         index = read_json(index_path) if index_path.exists() else {}
         if config.config_hash in index:
             prior = root / index[config.config_hash] / "attempts"
+            if resume_selection is not None and not prior.is_dir():
+                raise ExpectedError("The run's attempt records are missing. Refresh Monitor data.")
             requests = [read_json(p / "request.json") for p in prior.iterdir()]
             if requests:
                 executable = max(requests, key=lambda r: r["created_at"])["executable"]
@@ -99,6 +134,8 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
     build = executable_identity(executable)
     if continuation is not None and build.get("execution_interface") != "folder-v1":
         raise ValueError("Load further requires a current folder-based MTS2D build")
+    if resume_selection is not None and build.get("execution_interface") != "folder-v1":
+        raise ExpectedError("Resume requires a retained build with folder-based checkpoint loading.")
     if config["boundary"] == "rectangle" and not supports_rectangle_boundary(build):
         raise ValueError("Build MTS2D at the execution site to use rectangle boundary displacement")
     if config["deformation"] == "nanoindentation" and not supports_indentation(build):
@@ -124,6 +161,18 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         if matches:
             folder = output_root / matches[0]
         manifest_path = folder / "manifest.json"
+        if resume_selection is not None:
+            from .continuation import checkpoint_files, source_run
+            if str(folder) != resume_selection["folder"] or not matches:
+                raise ExpectedError("The run is no longer registered here. Refresh Monitor data.")
+            with source_run(output_root, resume_selection, verify_inactive=True) as (_, saved):
+                attempts = (folder / "attempts").iterdir()
+                latest = max(attempts, key=lambda a: read_json(a / "request.json")["created_at"], default=None)
+                if latest is None or attempt_status(latest)["state"] != "failed":
+                    raise ExpectedError("Select a run whose latest attempt failed.")
+                if saved.as_dict() != config.as_dict():
+                    raise ExpectedError("The saved configuration changed. Refresh Monitor data.")
+                checkpoint_files(folder)
         if continuation is not None and (matches or folder.exists() or folder.is_symlink()):
             raise ValueError("A run with these settings already exists at this site. Choose different settings.")
         if after:
@@ -256,8 +305,8 @@ def launch(attempt, *, mode="foreground", slurm=None, setup=""):
         else:
             temporary = shlex.quote(str(attempt / "exitcode.tmp"))
             destination = shlex.quote(str(attempt / "exitcode"))
-            text += ("set +e\n" + command + "\ncode=$?\nprintf '%s\\n' \"$code\" > "
-                     + temporary + "\nmv " + temporary + " " + destination + "\nexit \"$code\"\n")
+            text += ("set +e\n" + command + "\ncode=$?\nif printf '%s\\n' \"$code\" > "
+                     + temporary + "; then\n  mv " + temporary + " " + destination + "\nfi\nexit \"$code\"\n")
         script.write_text(text)
         cmd = ["bash", str(script)]
     try:
