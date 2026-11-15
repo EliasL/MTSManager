@@ -16,7 +16,7 @@ from .config import Config
 from .files import digest, file_digest, locked, now, read_json, write_json
 from .journal import Journal
 from .inventory_cache import invalidate as invalidate_inventory
-from .provenance import executable_identity, scripts_identity, retain_executable
+from .provenance import executable_identity, scripts_identity, retain_executable, supports_rectangle_boundary
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 ACTIVE = {"prepared", "queued", "running", "stopping"}
@@ -88,6 +88,8 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                 executable = max(requests, key=lambda r: r["created_at"])["executable"]
     executable = retain_executable(executable, Path(state_dir).resolve().parent / "executables")
     build = executable_identity(executable)
+    if config["boundary"] == "rectangle" and not supports_rectangle_boundary(build):
+        raise ValueError("Build MTS2D at the execution site to use rectangle boundary displacement")
     from .campaign import record_executable
     record_executable(campaign, site, executable)
     output_root = Path(output_root).resolve()

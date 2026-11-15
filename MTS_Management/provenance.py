@@ -254,3 +254,7 @@ def _verified_build(executable):
 
 def executable_identity(executable):
     return _verified_build(executable)
+
+
+def supports_rectangle_boundary(build):
+    return build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS))

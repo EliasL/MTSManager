@@ -11,6 +11,8 @@ from .files import digest
 
 DEFAULTS = json.loads(Path(__file__).with_name("defaults.json").read_text())
 SCHEMA_REVISION = "23e61580faa0c3a4d6c0ca7d730dfbe00d1da95f"
+RECTANGLE_EDGES = ("top", "bottom", "left", "right")
+RECTANGLE_SETTINGS = {"drivenEdge", *RECTANGLE_EDGES}
 
 
 class Config:
@@ -42,7 +44,7 @@ class Config:
             "stopWhen": {"all", "any"},
             "loading": {"relaxation", "reversibility", "noRelaxation"},
             "deformation": {"simpleShear", "directDisplacement", "sequentialSlip", "compression", "tension"},
-            "boundary": {"fixed", "periodic", "anchored", "periodicAnchored"},
+            "boundary": {"fixed", "periodic", "anchored", "periodicAnchored", "rectangle"},
             "reconnectionMethod": {"none", "edgeFlip", "delaunay"},
             "minimizer": {"LBFGS", "CG", "FIRE"},
             "preconditioner": {"none", "exactTangent", "diagonal"},
@@ -58,7 +60,9 @@ class Config:
             raise ValueError("rows, cols, nrThreads and LBFGSNrCorrections must be positive")
         if v["loadIncrement"] == 0 or v["totalLoad"] < 0 or v["segmentLoad"] < 0:
             raise ValueError("Invalid loading budget/increment")
-        directions = "".join(v["directions"].split()).split(",")
+        rectangle = v["boundary"] == "rectangle"
+        Config._validate_rectangle(v)
+        directions = [] if rectangle else "".join(v["directions"].split()).split(",")
         if v["deformation"] == "sequentialSlip":
             if v["boundary"] != "anchored" or min(v["rows"], v["cols"]) < 2:
                 raise ValueError("sequentialSlip requires an anchored mesh of at least 2 by 2 nodes")
@@ -91,7 +95,7 @@ class Config:
             raise ValueError("Invalid startLoad/totalLoad")
         if v["totalLoad"] > 0 and v["startLoad"] + v["totalLoad"] <= v["startLoad"]:
             raise ValueError("totalLoad is too small to advance startLoad")
-        if v["deformation"] in {"compression", "tension"} and (
+        if not rectangle and v["deformation"] in {"compression", "tension"} and (
                 v["boundary"] not in {"periodic", "fixed"} or
                 len(directions) != 1 or directions[0].startswith("-") or
                 v["repeat"] or v["segmentLoad"] != 0 or v["loadIncrement"] <= 0 or v["startLoad"] < 0 or
@@ -118,11 +122,47 @@ class Config:
             if v[k] < 0:
                 raise ValueError(f"{k} must be nonnegative")
 
+    @staticmethod
+    def _validate_rectangle(v):
+        if v["boundary"] != "rectangle":
+            if any(v[key] != DEFAULTS[key] for key in RECTANGLE_SETTINGS):
+                raise ValueError("Edge settings require boundary = rectangle")
+            return
+        if (v["deformation"] not in {"compression", "tension"} or
+                v["energyFunction"] != "contiSquare" or min(v["rows"], v["cols"]) < 2):
+            raise ValueError("Rectangle boundary displacement requires compression or tension "
+                             "on a square-lattice mesh of at least 2 by 2 nodes")
+        if v["reconnectionMethod"] == "delaunay":
+            raise ValueError("Delaunay reconnection requires periodic boundaries. "
+                             "Use edgeFlip or none for a rectangle")
+        driven = v["drivenEdge"]
+        if driven not in RECTANGLE_EDGES:
+            raise ValueError("drivenEdge must be top, bottom, left, or right")
+        for edge in RECTANGLE_EDGES:
+            if v[edge] not in {"free", "fixed_x", "fixed_y", "fixed"}:
+                raise ValueError(f"{edge} must be free, fixed_x, fixed_y, or fixed")
+        vertical = driven in {"top", "bottom"}
+        adjacent = ("left", "right") if vertical else ("top", "bottom")
+        normal_constraint = "fixed_y" if vertical else "fixed_x"
+        for edge in adjacent:
+            if v[edge] in {"fixed", normal_constraint}:
+                raise ValueError(f"{edge} fixes the driven component at a shared corner")
+        if v["repeat"] or v["segmentLoad"] != 0 or v["loadIncrement"] <= 0 or v["startLoad"] < 0:
+            raise ValueError("Boundary displacement requires a nonnegative start, a positive "
+                             "increment, and no loading segments or repetition")
+        span = v["rows" if vertical else "cols"] - 1
+        if v["deformation"] == "compression" and v["startLoad"] + v["totalLoad"] >= span:
+            raise ValueError("Final compression displacement must be less than "
+                             "the initial distance between loaded edges")
+
     def __getitem__(self, key):
         return self._values[key]
 
     def as_dict(self):
-        return dict(getattr(self, "_original", self._values))
+        if hasattr(self, "_original"):
+            return dict(self._original)
+        return {key: value for key, value in self._values.items()
+                if self["boundary"] == "rectangle" or key not in RECTANGLE_SETTINGS}
 
     @property
     def config_hash(self):
@@ -151,6 +191,8 @@ class Config:
     def saved(cls, values, supplement=None):
         """Resolve absent campaign settings without changing the saved identity."""
         missing = DEFAULTS.keys() - values.keys()
+        if values.get("boundary") != "rectangle":
+            missing -= RECTANGLE_SETTINGS
         if supplement is None:
             supplement = {}
         if missing and not supplement:
