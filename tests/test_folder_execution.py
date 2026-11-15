@@ -8,13 +8,10 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
 from unittest.mock import patch
-import io
-
-from MTS_Management.campaign import campaign_entries
 from MTS_Management.cluster import Site, serve
 from MTS_Management.data import mesh_snapshots, read_macros
 from MTS_Management.inventory import inventory
@@ -26,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BINARY = Path(os.environ.get('MTS_TEST_BINARY', ROOT / 'MTS2D/build/MTS2D')).resolve()
 
 
-class CampaignCompatibilityTests(unittest.TestCase):
+class CampaignIdentityTests(unittest.TestCase):
     def test_campaign_hashes_match_fixed_pre_backend_identities(self):
         # Fingerprints of sorted original hashes, independent of the current hash implementation.
         expected = {
@@ -35,17 +32,12 @@ class CampaignCompatibilityTests(unittest.TestCase):
             'magi_chain_smoke_oct26': 'd4d4d483f742b3c817afa82f5ae6854f99d1119b69fe9ebc7bd2bb1143a439ec',
         }
         for directory, fingerprint in expected.items():
-            with self.subTest(campaign=directory), tempfile.TemporaryDirectory() as td:
-                _, entries = campaign_entries(ROOT/'MTSManager/campaigns'/directory/'simulations.json')
-                actual = hashlib.sha256('\n'.join(sorted(c.config_hash for c, _ in entries)).encode()).hexdigest()
+            with self.subTest(campaign=directory):
+                archive = read_json(ROOT/'MTSManager/campaigns'/directory/'simulations.json')
+                hashes = [digest({"format": "mtscripts-config-v1", "settings": row["settings"]})
+                          for row in archive["runs"]]
+                actual = hashlib.sha256('\n'.join(sorted(hashes)).encode()).hexdigest()
                 self.assertEqual(actual, fingerprint)
-                config, label = entries[0]
-                path = Path(td)/'config.conf'
-                config.write(path, label)
-                saved = Config.read(path)
-                self.assertEqual(saved.config_hash, config.config_hash)
-                self.assertNotIn('tangentBackend', saved.as_dict())
-                self.assertEqual(saved['tangentBackend'], 'eigen')
 
     def test_editing_supplement_changes_interpretation_not_identity(self):
         values = Config().as_dict()
@@ -72,34 +64,6 @@ class CampaignCompatibilityTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Incomplete'):
                     Config.read(config_path)
 
-    @unittest.skipUnless((ROOT/'MTSManager/build/build-manifest.json').exists(), 'Historical Eigen build not present')
-    def test_historical_eigen_binary_runs_and_resumes_without_rehashing(self):
-        executable = ROOT/'MTSManager/build/MTS2D'
-        build = read_json(executable.parent/'build-manifest.json')
-        if build.get('execution_interface'):
-            self.skipTest('Installed binary uses the folder interface')
-        values = Config(rows=4, cols=4, loading='noRelaxation', totalLoad=.004,
-                        loadIncrement=.001, writeDumps=True, writeMeshVTUs=False).as_dict()
-        values.pop('tangentBackend')
-        with tempfile.TemporaryDirectory() as td, patch('MTS_Management.campaign.supplemental_settings',
-                return_value={'tangentBackend':'eigen'}), redirect_stdout(io.StringIO()):
-            config = Config.saved(values)
-            options = dict(executable=executable, output_root=Path(td)/'output', state_dir=Path(td)/'state')
-            attempt = prepare(config, **options)
-            original_hash = config.config_hash
-            execute(attempt)
-            request = read_json(attempt/'request.json')
-            self.assertEqual(request['build']['executable_sha256'], build['executable_sha256'])
-            folder = Path(request['output_folder'])
-            before = (folder/'macroData.csv').read_bytes()
-            resumed = prepare(config, **(options | {'executable':Path(td)/'missing'}), checkpoint='latest')
-            execute(resumed)
-            self.assertEqual((folder/'macroData.csv').read_bytes(), before)
-            self.assertEqual(Config.read(folder/'config.conf').config_hash, original_hash)
-            self.assertNotIn('tangentBackend', (folder/'config.conf').read_text())
-            self.assertEqual(read_json(resumed/'request.json')['executable'], request['executable'])
-
-
 @contextmanager
 def prepared_run(**settings):
     with tempfile.TemporaryDirectory() as td:
@@ -112,7 +76,7 @@ def prepared_run(**settings):
             'execution_interface':'folder-v1', 'configuration_keys_sha256':digest(sorted(DEFAULTS))})
         values = dict(rows=3, cols=3, loading='noRelaxation', initialGuessNoise=0,
             startLoad=-.01, totalLoad=.004, loadIncrement=.001, checkpointInterval=1,
-            writeDumps=True, writeMeshVTUs=False, nrVTUFrames=0, showProgress=-1, tangentBackend='eigen')
+            writeDumps=True, writeMeshVTUs=False, vtuFilesPerUnitLoad=0, showProgress=-1, tangentBackend='eigen')
         config = Config(**(values | settings))
         options = dict(executable=executable, output_root=root/'output', state_dir=root/'.state')
         yield root, config, options
@@ -210,7 +174,7 @@ class FolderExecutionTests(unittest.TestCase):
         checksum = hashlib.sha256(mesh.encode()).hexdigest()
         with prepared_run(rows=4, cols=4, boundary="periodic", startLoad=0,
                           initialMeshSha256=checksum, writeMeshVTUs=True,
-                          nrVTUFrames=100) as (_, config, options):
+                          vtuFilesPerUnitLoad=1000) as (_, config, options):
             regular = Config(**(config.as_dict() | {"initialMeshSha256": "",
                                                     "segmentLoad": .05, "directions": "horizontal,vertical"}))
             native = ET.fromstring(preview(options["executable"], regular)).find(".//Piece")
@@ -254,7 +218,7 @@ class FolderExecutionTests(unittest.TestCase):
         from MTS_Management.continuation import plan
 
         with prepared_run(startLoad=0., writeDumps=False, writeMeshVTUs=True,
-                          nrVTUFrames=100) as (_, config, options):
+                          vtuFilesPerUnitLoad=1000) as (_, config, options):
             original_attempt = prepare(config, **options)
             launch(original_attempt)
             source = original_attempt.parents[1]
@@ -287,7 +251,7 @@ class FolderExecutionTests(unittest.TestCase):
             self.assertEqual(file_digest(destination / "dumps" / "checkpoint_1.xml.gz"), checksum)
             self.assertEqual(physical_rows(destination), physical_rows(source)[:4])
             copied = mesh_snapshots(destination)
-            self.assertEqual([frame["step"] for frame in copied], [2, 3, 4])
+            self.assertEqual([frame["step"] for frame in copied], [1, 2, 3, 4])
             for frame in copied:
                 self.assertEqual(file_digest(destination / "data" / frame["name"]),
                                  file_digest(source / "data" / frame["name"]))

@@ -21,7 +21,7 @@ from .journal import Journal
 from .inventory_cache import invalidate as invalidate_inventory
 from .provenance import (
     executable_identity, scripts_identity, retain_executable,
-    supports_indentation, supports_rectangle_boundary, supports_initial_mesh,
+    supports_current_configuration, supports_initial_mesh,
 )
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -144,10 +144,8 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         raise ExpectedError("Resume requires a retained build with folder-based checkpoint loading.")
     if config["initialMeshSha256"] and not supports_initial_mesh(build):
         raise ExpectedError("Build MTS2D at the execution site to use a custom initial mesh.")
-    if config["boundary"] == "rectangle" and not supports_rectangle_boundary(build):
-        raise ValueError("Build MTS2D at the execution site to use rectangle boundary displacement")
-    if config["deformation"] == "nanoindentation" and not supports_indentation(build):
-        raise ValueError("Build MTS2D at the execution site to use nanoindentation")
+    if not supports_current_configuration(build):
+        raise ValueError("Build MTS2D at the execution site to use the current configuration")
     from .campaign import record_executable
     record_executable(campaign, site, executable)
     output_root = Path(output_root).resolve()

@@ -61,6 +61,7 @@ class Config:
             "tangentBackend": {"cholmod", "eigen"},
             "preconditionerUpdate": {"adaptive", "every", "frozen"},
             "energyFunction": {"contiSquare", "contiTriangular"},
+            "constitutiveReference": {"areaNormalizedTriangular"},
             "meshDiagonal": {"major", "minor"},
         }
         for key, allowed in choices.items():
@@ -127,7 +128,10 @@ class Config:
             raise ValueError("preconditionerDisplacementThreshold must be positive")
         if v["forceReRun"]:
             raise ValueError("forceReRun is disabled; create a separate output root for reruns")
-        for k in ("checkpointInterval", "maximumSavedElasticReversibilityStates", "nrVTUFrames",
+        if (v["vtuFilesPerUnitLoad"] < 0 or (v["writeMeshVTUs"] and v["vtuFilesPerUnitLoad"] == 0)
+                or not math.isfinite(v["vtuFilesPerUnitLoad"] * v["totalLoad"])):
+            raise ValueError("VTU files per unit load must be finite and positive when mesh output is enabled")
+        for k in ("checkpointInterval", "maximumSavedElasticReversibilityStates",
                   "LBFGSMaxIterations", "CGMaxIterations", "maxIt", "epsR", "QDSD",
                   "initialGuessNoise", "stepNoise", "reversibilityTolerance"):
             if v[k] < 0:
@@ -139,10 +143,9 @@ class Config:
             if any(v[key] != DEFAULTS[key] for key in RECTANGLE_SETTINGS):
                 raise ValueError("Edge settings require boundary = rectangle")
             return
-        if (v["deformation"] not in {"compression", "tension"} or
-                v["energyFunction"] != "contiSquare" or min(v["rows"], v["cols"]) < 2):
+        if v["deformation"] not in {"compression", "tension"} or min(v["rows"], v["cols"]) < 2:
             raise ValueError("Rectangle boundary displacement requires compression or tension "
-                             "on a square-lattice mesh of at least 2 by 2 nodes")
+                             "on a mesh of at least 2 by 2 nodes")
         if v["reconnectionMethod"] == "delaunay":
             raise ValueError("Delaunay reconnection requires periodic boundaries. "
                              "Use edgeFlip or none for a rectangle")
@@ -153,6 +156,9 @@ class Config:
             if v[edge] not in {"free", "fixed_x", "fixed_y", "fixed"}:
                 raise ValueError(f"{edge} must be free, fixed_x, fixed_y, or fixed")
         vertical = driven in {"top", "bottom"}
+        triangular = v["energyFunction"] == "contiTriangular"
+        if triangular and not vertical:
+            raise ValueError("Choose the top or bottom driven edge for a triangular sample")
         adjacent = ("left", "right") if vertical else ("top", "bottom")
         normal_constraint = "fixed_y" if vertical else "fixed_x"
         for edge in adjacent:
@@ -161,7 +167,7 @@ class Config:
         if v["repeat"] or v["segmentLoad"] != 0 or v["loadIncrement"] <= 0 or v["startLoad"] < 0:
             raise ValueError("Boundary displacement requires a nonnegative start, a positive "
                              "increment, and no loading segments or repetition")
-        span = v["rows" if vertical else "cols"] - 1
+        span = (v["rows" if vertical else "cols"] - 1) * (math.sqrt(3) / 2 if triangular else 1)
         if v["deformation"] == "compression" and v["startLoad"] + v["totalLoad"] >= span:
             raise ValueError("Final compression displacement must be less than "
                              "the initial distance between loaded edges")
@@ -201,6 +207,8 @@ class Config:
             excluded.update(RECTANGLE_SETTINGS)
         if values.get("deformation") != "nanoindentation":
             excluded.update(INDENTATION_SETTINGS)
+        if values.get("energyFunction") != "contiTriangular":
+            excluded.add("constitutiveReference")
         return excluded
 
     @property

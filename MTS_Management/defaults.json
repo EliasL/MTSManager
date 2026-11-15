@@ -18,6 +18,7 @@
   "bulkModulus": 4.0,
   "checkpointInterval": 0,
   "cols": 3,
+  "constitutiveReference": "areaNormalizedTriangular",
   "deformation": "simpleShear",
   "delta": 0.0,
   "directions": "horizontal",
@@ -50,7 +51,6 @@
   "minimizer": "LBFGS",
   "minimum_transport_distance": true,
   "nrThreads": 1,
-  "nrVTUFrames": 100,
   "plasticityEventThreshold": 0.01,
   "preconditioner": "exactTangent",
   "preconditionerDisplacementThreshold": 0.05,
@@ -79,6 +79,7 @@
   "top": "free",
   "totalLoad": 1.0,
   "writeDebugVTUs": false,
+  "vtuFilesPerUnitLoad": 100.0,
   "writeDumps": true,
   "writeMeshVTUs": true
 }

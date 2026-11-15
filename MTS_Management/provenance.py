@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 
-from .config import DEFAULTS, INDENTATION_SETTINGS
+from .config import DEFAULTS
 from .files import digest, file_digest, read_json, write_json, now, locked
 
 
@@ -256,14 +256,9 @@ def executable_identity(executable):
     return _verified_build(executable)
 
 
-def supports_rectangle_boundary(build):
-    return (supports_indentation(build) or
-            build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS.keys() - INDENTATION_SETTINGS - {"initialMeshSha256"})))
-
-
-def supports_indentation(build):
-    return (supports_initial_mesh(build) or build.get("configuration_keys_sha256") ==
-            digest(sorted(DEFAULTS.keys() - {"initialMeshSha256"})))
+def supports_current_configuration(build):
+    keys = build.get("configuration_keys_sha256")
+    return supports_initial_mesh(build) or keys == digest(sorted(DEFAULTS.keys() - {"initialMeshSha256"}))
 
 
 def supports_initial_mesh(build):
