@@ -16,6 +16,19 @@ RECTANGLE_SETTINGS = {"drivenEdge", *RECTANGLE_EDGES}
 INDENTATION_SETTINGS = {"indenterRadius", "indentationContact"}
 
 
+def driven_normal(edge):
+    return "fixed_y" if edge in {"top", "bottom"} else "fixed_x"
+
+
+def validate_driven_edge(settings):
+    if settings.get("boundary") == "rectangle":
+        edge = settings["drivenEdge"]
+        normal = driven_normal(edge)
+        if settings[edge] not in {normal, "fixed"}:
+            from .errors import ExpectedError
+            raise ExpectedError(f"Set {edge} to {normal} or fixed for boundary displacement.")
+
+
 class Config:
     def __init__(self, **settings):
         unknown = settings.keys() - DEFAULTS.keys()
@@ -160,7 +173,8 @@ class Config:
         if triangular and not vertical:
             raise ValueError("Choose the top or bottom driven edge for a triangular sample")
         adjacent = ("left", "right") if vertical else ("top", "bottom")
-        normal_constraint = "fixed_y" if vertical else "fixed_x"
+        normal_constraint = driven_normal(driven)
+        validate_driven_edge(v)
         for edge in adjacent:
             if v[edge] in {"fixed", normal_constraint}:
                 raise ValueError(f"{edge} fixes the driven component at a shared corner")
@@ -195,6 +209,9 @@ class Config:
     def as_dict(self):
         if hasattr(self, "_original"):
             return dict(self._original)
+        return self.effective_dict()
+
+    def effective_dict(self):
         excluded = self.inactive_settings(self._values)
         return {key: value for key, value in self._values.items() if key not in excluded}
 
@@ -245,8 +262,17 @@ class Config:
             supplement = supplemental_settings(values)
         if missing - supplement.keys() or values.keys() - DEFAULTS.keys():
             raise ValueError(f"Incomplete/unknown settings: {sorted((missing - supplement.keys()) | (values.keys() - DEFAULTS.keys()))}")
-        result = cls(**(supplement | values))
-        result._original = {k: result[k] for k in values}
+        effective = supplement | values
+        edge = effective.get("drivenEdge")
+        if effective.get("boundary") == "rectangle" and edge in RECTANGLE_EDGES:
+            normal = driven_normal(edge)
+            transverse = "fixed_x" if normal == "fixed_y" else "fixed_y"
+            if effective.get(edge) == "free":
+                effective[edge] = normal
+            elif effective.get(edge) == transverse:
+                effective[edge] = "fixed"
+        result = cls(**effective)
+        result._original = {k: values[k] if k == edge else result[k] for k in values}
         return result
 
     @classmethod
@@ -299,7 +325,7 @@ def sweep(base=None, **axes):
         if "L" in settings:
             size = settings.pop("L")
             settings.update(rows=size, cols=size)
-        values = base.as_dict() | settings
+        values = base.effective_dict() | settings
         if values["deformation"] == "sequentialSlip" and "directions" in settings and "totalLoad" not in settings:
             values.pop("totalLoad")
         result.append(Config(**values))

@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 
-from .config import Config
+from .config import Config, validate_driven_edge
 from .errors import ExpectedError
 from .files import digest, file_digest, locked, now, read_json, write_json
 from .initial_mesh import MESH_FILE, mesh_bytes, mesh_checksum, verify_mesh
@@ -117,6 +117,8 @@ def attempt_status(attempt):
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
             checkpoint=None, site="local", environment=None, after=None, continuation=None,
             resume_selection=None, initial_mesh=None, log=None):
+    if not checkpoint and continuation is None:
+        validate_driven_edge(config.as_dict())
     if initial_mesh is not None and mesh_checksum(initial_mesh) != config["initialMeshSha256"]:
         raise ExpectedError("The initial mesh checksum differs from config.conf.")
     if initial_mesh is not None and (checkpoint or continuation is not None):
