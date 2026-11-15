@@ -18,8 +18,8 @@ from MTS_Management.campaign import campaign_entries
 from MTS_Management.cluster import Site, serve
 from MTS_Management.data import mesh_snapshots, read_macros
 from MTS_Management.inventory import inventory
-from MTS_Management.config import Config
-from MTS_Management.files import file_digest, read_json, write_json
+from MTS_Management.config import Config, DEFAULTS
+from MTS_Management.files import digest, file_digest, read_json, write_json
 from MTS_Management.runner import prepare, launch, execute, attempt_status
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -109,7 +109,7 @@ def prepared_run(**settings):
         shutil.copy2(BINARY, executable)
         write_json(executable.parent/'build-manifest.json', {
             'branch':'main', 'revision':'fixture', 'executable_sha256':file_digest(executable),
-            'execution_interface':'folder-v1', 'configuration_keys_sha256':'historical-schema'})
+            'execution_interface':'folder-v1', 'configuration_keys_sha256':digest(sorted(DEFAULTS))})
         values = dict(rows=3, cols=3, loading='noRelaxation', initialGuessNoise=0,
             startLoad=-.01, totalLoad=.004, loadIncrement=.001, checkpointInterval=1,
             writeDumps=True, writeMeshVTUs=False, nrVTUFrames=0, showProgress=-1, tangentBackend='eigen')
@@ -182,6 +182,74 @@ class CheckpointSelectionTests(unittest.TestCase):
 
 @unittest.skipUnless(BINARY.exists(), 'Build MTS2D before simulator lifecycle tests')
 class FolderExecutionTests(unittest.TestCase):
+    def test_custom_periodic_mesh_keeps_cut_and_restored_diagonal(self):
+        from MTS_Management.continuation import plan
+        from MTS_Management.initial_mesh import preview
+
+        # Cut the four tiles adjoining (2, 2) and keep one alternate diagonal.
+        points = [(x, y, 0) for y in range(5) for x in range(5)]
+        cells = []
+        for y in range(4):
+            for x in range(4):
+                if x in (1, 2) and y in (1, 2):
+                    continue
+                a = 5 * y + x
+                cells.extend(((a, a+1, a+6), (a, a+6, a+5)) if a == 0 else
+                             ((a, a+1, a+5), (a+1, a+6, a+5)))
+        coordinates = " ".join(str(value) for point in points for value in point)
+        connectivity = " ".join(str(value) for cell in cells for value in cell)
+        offsets = " ".join(str(3 * (i + 1)) for i in range(len(cells)))
+        mesh = f'''<VTKFile type="UnstructuredGrid"><UnstructuredGrid>
+          <Piece NumberOfPoints="25" NumberOfCells="24">
+          <Points><DataArray format="ascii" NumberOfComponents="3">{coordinates}</DataArray></Points>
+          <Cells>
+            <DataArray format="ascii" Name="connectivity">{connectivity}</DataArray>
+            <DataArray format="ascii" Name="offsets">{offsets}</DataArray>
+            <DataArray format="ascii" Name="types">{'5 ' * len(cells)}</DataArray>
+          </Cells></Piece></UnstructuredGrid></VTKFile>'''
+        checksum = hashlib.sha256(mesh.encode()).hexdigest()
+        with prepared_run(rows=4, cols=4, boundary="periodic", startLoad=0,
+                          initialMeshSha256=checksum, writeMeshVTUs=True,
+                          nrVTUFrames=100) as (_, config, options):
+            regular = Config(**(config.as_dict() | {"initialMeshSha256": "",
+                                                    "segmentLoad": .05, "directions": "horizontal,vertical"}))
+            native = ET.fromstring(preview(options["executable"], regular)).find(".//Piece")
+            lattice = native.find("PointData/DataArray[@Name='lattice_index']").text.split()
+            loaded = native.find("PointData/DataArray[@Name='loaded_position']").text.split()
+            seam = next(i for i in range(0, len(lattice), 3) if lattice[i:i+3] == ["0", "4", "0"])
+            self.assertEqual(list(map(float, loaded[seam:seam+3])), [0.2, 4.01, 0])
+
+            attempt = prepare(config, **options, initial_mesh=mesh)
+            folder = attempt.parents[1]
+            asset = folder / "initialMesh.vtu"
+            asset.write_text(mesh + "\n")
+            failed = subprocess.run([options["executable"], folder, "--resume"], capture_output=True, text=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("checksum", failed.stderr)
+            self.assertFalse((folder / "macroData.csv").exists())
+            asset.write_text(mesh)
+            launch(attempt)
+            self.assertEqual(file_digest(asset), checksum)
+            first = mesh_snapshots(folder)[0]
+            piece = ET.parse(folder / "data" / first["name"]).find(".//Piece")
+            values = list(map(float, piece.find("Points/DataArray").text.split()))
+            xyz = [(round(x - first["load"] * y, 10), y, z)
+                   for x, y, z in zip(values[::3], values[1::3], values[2::3])]
+            native_cells = list(map(int, piece.find("Cells/DataArray[@Name='connectivity']").text.split()))
+            actual = {frozenset(xyz[i] for i in native_cells[j:j+3]) for j in range(0, len(native_cells), 3)}
+            self.assertEqual(actual, {frozenset(points[i] for i in cell) for cell in cells})
+
+            selection = {"folder": str(folder), "config_hash": config.config_hash,
+                         "manifest_sha256": file_digest(folder / "manifest.json")}
+            reviewed = plan(options["output_root"], selection)
+            extended = Config(**(reviewed["settings"] | {"totalLoad": .006}))
+            continuation = prepare(extended, **options, continuation=selection |
+                                   {"checkpoint_catalog": reviewed["checkpoint_catalog"]}, log=lambda _: None)
+            launch(continuation)
+            continued = continuation.parents[1]
+            self.assertEqual(file_digest(continued / asset.name), checksum)
+            self.assertAlmostEqual(float(physical_rows(continued)[-1][1]), .006)
+
     def test_load_further_copies_only_history_through_checkpoint(self):
         from MTS_Management.continuation import plan
 

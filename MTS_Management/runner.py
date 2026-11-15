@@ -16,10 +16,12 @@ import uuid
 from .config import Config
 from .errors import ExpectedError
 from .files import digest, file_digest, locked, now, read_json, write_json
+from .initial_mesh import MESH_FILE, mesh_bytes, mesh_checksum, verify_mesh
 from .journal import Journal
 from .inventory_cache import invalidate as invalidate_inventory
 from .provenance import (
-    executable_identity, scripts_identity, retain_executable, supports_indentation, supports_rectangle_boundary,
+    executable_identity, scripts_identity, retain_executable,
+    supports_indentation, supports_rectangle_boundary, supports_initial_mesh,
 )
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -114,7 +116,11 @@ def attempt_status(attempt):
 
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
             checkpoint=None, site="local", environment=None, after=None, continuation=None,
-            resume_selection=None, log=None):
+            resume_selection=None, initial_mesh=None, log=None):
+    if initial_mesh is not None and mesh_checksum(initial_mesh) != config["initialMeshSha256"]:
+        raise ExpectedError("The initial mesh checksum differs from config.conf.")
+    if initial_mesh is not None and (checkpoint or continuation is not None):
+        raise ExpectedError("A checkpoint continuation uses its original initial mesh.")
     if continuation is not None and (checkpoint or after):
         raise ValueError("Choose either a new continuation folder or an existing run to resume")
     if resume_selection is not None and (checkpoint != "latest" or after):
@@ -136,6 +142,8 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         raise ValueError("Load further requires a current folder-based MTS2D build")
     if resume_selection is not None and build.get("execution_interface") != "folder-v1":
         raise ExpectedError("Resume requires a retained build with folder-based checkpoint loading.")
+    if config["initialMeshSha256"] and not supports_initial_mesh(build):
+        raise ExpectedError("Build MTS2D at the execution site to use a custom initial mesh.")
     if config["boundary"] == "rectangle" and not supports_rectangle_boundary(build):
         raise ValueError("Build MTS2D at the execution site to use rectangle boundary displacement")
     if config["deformation"] == "nanoindentation" and not supports_indentation(build):
@@ -197,13 +205,13 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                 raise FileExistsError(f"Run already exists; explicitly resume a checkpoint: {folder}")
             if Config.read(folder / "config.conf", expected_name=folder.name).config_hash != config.config_hash:
                 raise ValueError("Saved configuration changed")
+            verify_mesh(folder, config)
         else:
             if folder.exists():
                 raise FileExistsError(f"Unmanaged output directory: {folder}")
             from .archive import archived_runs
             archived = archived_runs(output_root, {config.config_hash})
             if archived:
-                from .errors import ExpectedError
                 raise ExpectedError(f"Restore the archived run and rebuild the inventory before launching: {archived[0]['folder']}")
             if checkpoint is not None or resume_latest:
                 raise ValueError("Resume requires the original managed output folder and configuration")
@@ -219,6 +227,16 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                     staged.rename(folder)
                 checkpoint = folder / record["saved_checkpoint"]
                 resume_latest = True
+            elif config["initialMeshSha256"]:
+                if initial_mesh is None:
+                    raise ExpectedError(f"Supply {MESH_FILE} with the custom run configuration.")
+                with TemporaryDirectory(prefix=".initial-mesh-", dir=output_root) as temporary:
+                    staged = Path(temporary) / folder.name
+                    staged.mkdir()
+                    (staged / MESH_FILE).write_bytes(mesh_bytes(initial_mesh))
+                    (staged / "config.conf").write_text(config.text(folder.name))
+                    write_json(staged / "manifest.json", manifest)
+                    staged.rename(folder)
             else:
                 folder.mkdir()
                 (folder / "config.conf").write_text(config.text(folder.name))

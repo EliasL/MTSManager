@@ -258,8 +258,13 @@ def executable_identity(executable):
 
 def supports_rectangle_boundary(build):
     return (supports_indentation(build) or
-            build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS.keys() - INDENTATION_SETTINGS)))
+            build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS.keys() - INDENTATION_SETTINGS - {"initialMeshSha256"})))
 
 
 def supports_indentation(build):
+    return (supports_initial_mesh(build) or build.get("configuration_keys_sha256") ==
+            digest(sorted(DEFAULTS.keys() - {"initialMeshSha256"})))
+
+
+def supports_initial_mesh(build):
     return build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS))

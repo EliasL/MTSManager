@@ -43,6 +43,11 @@ class Config:
 
     @staticmethod
     def _validate(v):
+        if v["initialMeshSha256"]:
+            if not re.fullmatch(r"[a-f0-9]{64}", v["initialMeshSha256"]):
+                raise ValueError("initialMeshSha256 must be a lowercase SHA-256 checksum")
+            if v["reconnectionMethod"] == "delaunay":
+                raise ValueError("Use None or Edge flip reconnection for a custom initial mesh")
         choices = {
             "stopWhen": {"all", "any"},
             "loading": {"relaxation", "reversibility", "noRelaxation"},
@@ -190,6 +195,8 @@ class Config:
     @staticmethod
     def inactive_settings(values):
         excluded = set()
+        if not values.get("initialMeshSha256"):
+            excluded.add("initialMeshSha256")
         if values.get("boundary") != "rectangle":
             excluded.update(RECTANGLE_SETTINGS)
         if values.get("deformation") != "nanoindentation":

@@ -18,7 +18,9 @@ import time
 import tomllib
 
 from .config import Config, DEFAULTS
+from .errors import EXPECTED_ERROR_EXIT, ExpectedError
 from .files import canonical, digest, file_digest, locked, now, read_json, write_json
+from .initial_mesh import MESH_FILE, verify_mesh
 from .inventory import inventory, rebuild_index, remove_missing, resources
 from .inventory_cache import export as export_inventory, snapshot as cached_inventory
 from .journal import Journal
@@ -202,6 +204,9 @@ def serve(payload, *, cancel=None, log=None):
     if op == "build":
         return build(p["source"], Path(p["executable"]).parent,
                      native_arch=site.native_arch, archive_dir=Path(site.directory).resolve() / "executables", **options)
+    if op == "mesh_preview":
+        from .initial_mesh import preview
+        return {"vtu": preview(p["executable"], Config.saved(options["settings"]))}
     if op == "resume":
         from .continuation import source_run
         from .errors import ExpectedError
@@ -233,6 +238,7 @@ def serve(payload, *, cancel=None, log=None):
         for i in range(chain):
             if i:
                 options.update(checkpoint="latest", after=jobs[-1]["attempt"])
+                options.pop("initial_mesh", None)
             attempt = prepare(config, executable=p["executable"], output_root=p["output_root"],
                               state_dir=p["state_dir"], site=site.name,
                               environment=site.environment, log=log, **options)
@@ -347,6 +353,11 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, *
             if log and progress is None and stderr.strip():
                 log(stderr.rstrip())
             if process.returncode:
+                if process.returncode == EXPECTED_ERROR_EXIT:
+                    if stderr.strip():
+                        raise ExpectedError(stderr.strip())
+                    if stdout.strip():
+                        raise ExpectedError(json.loads(stdout)["expected_error"])
                 if reader and process.returncode in {-14, 142}:
                     raise subprocess.TimeoutExpired(args, timeout, output=stdout, stderr=stderr)
                 if site.ssh and process.returncode == 255:
@@ -396,14 +407,16 @@ def synchronized_snapshot(sites, state_dir, *, operation="snapshot", **options):
     return result
 
 
-def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=None, chain=1):
+def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=None, chain=1,
+           initial_mesh=None):
     journal = Journal(state_dir)
     submission = journal.append("submission_requested", site=site.name,
                                 config_hash=config.config_hash, campaign=campaign,
                                 label=label, requested_output_root=site.output_root, chain=chain)
     try:
+        mesh_input = {"initial_mesh": initial_mesh} if initial_mesh is not None else {}
         result = call(site, "run", settings=config.as_dict(), campaign=campaign,
-                      label=label, checkpoint=checkpoint, chain=chain)
+                      label=label, checkpoint=checkpoint, chain=chain, **mesh_input)
     except Exception as error:
         journal.append("submission_error", submission_id=submission["event_id"],
                        site=site.name, config_hash=config.config_hash, campaign=campaign,
@@ -571,7 +584,7 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     destination.mkdir(parents=True, exist_ok=True)
     origin = f"{site.ssh}:{shlex.quote(str(root))}/" if site.ssh else str(root) + "/"
     filters = (["--include=/*/", "--include=macroData.csv", "--include=config.conf",
-                "--include=manifest.json", "--include=termination.json", "--exclude=*"]
+                "--include=manifest.json", "--include=termination.json", f"--include={MESH_FILE}", "--exclude=*"]
                if kind == "macro" else [])
     files = [Path(r["folder"]).name + "/\n" for r in rows]
     if mesh_frames is not None:
@@ -592,8 +605,11 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
         target = destination / Path(row["folder"]).name
         if file_digest(target / "manifest.json") != row["manifest_sha256"]:
             raise ValueError(f"Transferred manifest differs from inventory: {target}")
-        if Config.read(target / "config.conf", expected_name=target.name).config_hash != row["config_hash"]:
+        config = Config.read(target / "config.conf", expected_name=target.name)
+        if config.config_hash != row["config_hash"]:
             raise ValueError(f"Transferred configuration differs from inventory: {target}")
+        if mesh_frames is None:
+            verify_mesh(target, config)
         if row.get("termination") is None:
             (target / "termination.json").unlink(missing_ok=True)
     write_json(destination / "snapshot.json", dict(fetched_at=now(), site=site.name,

@@ -38,6 +38,7 @@
   "indentationContact": "penalty",
   "indenterRadius": 25.0,
   "initialGuessNoise": 0.05,
+  "initialMeshSha256": "",
   "left": "free",
   "loadIncrement": 0.1,
   "loading": "relaxation",

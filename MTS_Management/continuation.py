@@ -16,6 +16,7 @@ from .config import Config, DEFAULTS, INDENTATION_SETTINGS, RECTANGLE_SETTINGS
 from .data import last_macro_row, mesh_snapshots
 from .errors import ExpectedError
 from .files import digest, file_digest, locked, read_json
+from .initial_mesh import MESH_FILE, verify_mesh
 
 
 TARGETS = {
@@ -25,7 +26,7 @@ TARGETS = {
 }
 FIXED_SETTINGS = {"rows", "cols", "seed", "QDSD", "meshDiagonal", "energyFunction",
                   "bulkModulus", "boundary", "deformation", "startLoad", "loading",
-                  "reconnectionMethod"} | RECTANGLE_SETTINGS | INDENTATION_SETTINGS
+                  "reconnectionMethod", "initialMeshSha256"} | RECTANGLE_SETTINGS | INDENTATION_SETTINGS
 DUMP = re.compile(r"(?:checkpoint_.*|dump_l.*)\.xml\.gz")
 NAMED_LOAD = re.compile(r"dump_l([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\.xml\.gz")
 VTU_STEP = re.compile(r".*\.(\d+)\.vtu")
@@ -334,9 +335,13 @@ def stage(root, destination, config, selection, *, log):
                       (original_dump, destination / "dumps" / f"checkpoint_{slot}.xml.gz")])
         for name in ("config.conf", "manifest.json"):
             files.append((source / name, provenance / name))
+        if config["initialMeshSha256"]:
+            verify_mesh(source, original)
+            files.append((source / MESH_FILE, destination / MESH_FILE))
         if reviewed and "revision" not in reviewed and file_digest(original_dump) != reviewed["sha256"]:
             raise ExpectedError("The reviewed checkpoint has changed. Select Load further again.")
         checksum = copy_history_files(files, saved, log)
+        verify_mesh(destination, config)
         if checkpoint_revision(original_dump) != checkpoint["revision"]:
             raise ExpectedError("The reviewed checkpoint changed during copying.")
         write_collections(source, destination, collections)

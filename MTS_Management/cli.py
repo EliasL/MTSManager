@@ -78,6 +78,7 @@ def parser():
             c.add_argument("--campaign", default="AdHoc")
             c.add_argument("--label")
             c.add_argument("--checkpoint", help="Checkpoint path on the execution host, or 'latest'")
+            c.add_argument("--initial-mesh", type=Path, help="ASCII VTU on the configured lattice")
         else:
             c.add_argument("--workers", type=int, default=2)
     for name in ("stop", "logs"):
@@ -209,6 +210,23 @@ def _run_command(argv):
                 call(site, "install_campaign_files", records=[records])
         campaign, entries = ((args.campaign, [(Config.read(args.path), args.label)])
                              if args.command == "run" else campaign_entries(args.path))
+        initial_mesh = None
+        if args.command == "run" and args.initial_mesh is not None:
+            from .initial_mesh import MAX_MESH_BYTES, mesh_checksum
+            config, label = entries[0]
+            with args.initial_mesh.open("rb") as stream:
+                initial_mesh = stream.read(MAX_MESH_BYTES + 1)
+            if len(initial_mesh) > MAX_MESH_BYTES:
+                raise ExpectedError("The initial VTU must be at most 16 MiB.")
+            try:
+                initial_mesh = initial_mesh.decode("ascii")
+            except UnicodeDecodeError as error:
+                raise ExpectedError("Supply an ASCII VTU file for the initial mesh.") from error
+            checksum = mesh_checksum(initial_mesh)
+            if config["initialMeshSha256"] and config["initialMeshSha256"] != checksum:
+                raise ExpectedError("The initial mesh checksum differs from config.conf.")
+            config = Config(**(config.as_dict() | {"initialMeshSha256": checksum}))
+            entries = [(config, label)]
         if not site.ssh and site.mode == "foreground":
             p = paths(site)
             attempts = []
@@ -217,7 +235,7 @@ def _run_command(argv):
                     attempts.append(prepare(config, executable=p["executable"], output_root=p["output_root"],
                         state_dir=p["state_dir"], campaign=campaign, label=label,
                         checkpoint=args.checkpoint if args.command == "run" else None, site=site.name,
-                        environment=site.environment))
+                        environment=site.environment, initial_mesh=initial_mesh))
             except BaseException:
                 from .runner import set_status
                 for attempt in attempts:
@@ -231,7 +249,7 @@ def _run_command(argv):
         else:
             result = [submit(replace(site, slurm=site.slurm | resource_plan.get(str(config["rows"]), {})), config, state_dir=state_dir, campaign=campaign, label=label,
                              checkpoint=args.checkpoint if args.command == "run" else None,
-                             chain=args.chain)
+                             chain=args.chain, initial_mesh=initial_mesh)
                       for config, label in entries]
     elif args.command == "deploy":
         result = deploy(site, include_source=args.source is not None, local_source=args.source)
