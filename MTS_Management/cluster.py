@@ -24,6 +24,7 @@ from .initial_mesh import MESH_FILE, verify_mesh
 from .inventory import inventory, rebuild_index, remove_missing, resources
 from .inventory_cache import export as export_inventory, snapshot as cached_inventory
 from .journal import Journal
+from .processes import wait_cancellable
 from .provenance import build, install_source, source_archive, source_files, source_identity, executable_identity
 from .runner import PACKAGE_ROOT, RunConflict, attempt_log_tail, find_fresh_conflict, launch, prepare, stop
 
@@ -548,7 +549,7 @@ def fetch(site, config_hash, destination, *, kind="macro"):
 
 
 def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only=False,
-               expected_manifests=None, retain_binaries=True, mesh_frames=None):
+               expected_manifests=None, retain_binaries=True, mesh_frames=None, cancel=None):
     """Validate one inventory, then transfer selected runs in one rsync call.
 
     completed_only skips absent/not-yet-terminated campaign members explicitly.
@@ -568,7 +569,7 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     if not hashes:
         return []
     options = {"config_hashes": hashes} if all(len(h) == 64 for h in hashes) else {}
-    available = call(site, "inventory", **options)
+    available = call(site, "inventory", cancel=cancel, **options)
     selected = {}
     for prefix in hashes:
         matches = [r for r in available if r["config_hash"].startswith(prefix) and not r.get("missing")]
@@ -586,10 +587,12 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
             expected_manifests.get(r["config_hash"]) != r["manifest_sha256"] for r in rows):
         from .errors import ExpectedError
         raise ExpectedError("The remote run identity changed. Refresh Monitor data and try again.")
-    from .campaign import install_campaign_files
-    names = sorted({r["campaign"] for r in rows if r.get("campaign") not in (None, "AdHoc", "GUI")})
-    if names:
-        install_campaign_files(call(site, "campaign_files", names=names))
+    if mesh_frames is None:
+        from .campaign import install_campaign_files
+
+        names = sorted({r["campaign"] for r in rows if r.get("campaign") not in (None, "AdHoc", "GUI")})
+        if names:
+            install_campaign_files(call(site, "campaign_files", names=names, cancel=cancel))
     roots = {Path(r["folder"]).parent for r in rows}
     if len(roots) != 1:
         raise ValueError("Batch fetch requires runs in one output root")
@@ -622,8 +625,16 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     with tempfile.TemporaryDirectory() as temporary:
         listing = Path(temporary) / "runs.txt"
         listing.write_text("".join(files))
-        subprocess.run(["rsync", "-ar", "-e", "ssh -T", "--files-from=" + str(listing),
-                        *filters, origin, str(destination) + "/"], check=True)
+        command = ["rsync", "-ar", "-e", "ssh -T", "--files-from=" + str(listing),
+                   *filters, origin, str(destination) + "/"]
+        if cancel is None:
+            subprocess.run(command, check=True)
+        else:
+            if cancel.is_set():
+                raise CancelledError("Operation aborted.")
+            with subprocess.Popen(command, start_new_session=True) as process:
+                if code := wait_cancellable(process, cancel):
+                    raise subprocess.CalledProcessError(code, command)
     for row in rows:
         if retain_binaries and site.ssh and row.get("executable") and row.get("build"):
             archive_binary(site, row, row.get("campaign"), PACKAGE_ROOT / ".state")
