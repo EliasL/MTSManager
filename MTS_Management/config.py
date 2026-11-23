@@ -14,6 +14,21 @@ SCHEMA_REVISION = "23e61580faa0c3a4d6c0ca7d730dfbe00d1da95f"
 RECTANGLE_EDGES = ("top", "bottom", "left", "right")
 RECTANGLE_SETTINGS = {"drivenEdge", *RECTANGLE_EDGES}
 INDENTATION_SETTINGS = {"indenterRadius", "indentationContact"}
+_LEGACY_VTU_FRAMES = "nrVTUFrames"
+
+
+def _legacy_vtu_rate(frames, settings):
+    # Temporary saved-record adapter. Remove once pre-rate configurations and
+    # campaigns are retired. The old writer saved after 0.01 load or one
+    # frame-count interval from the last save, whichever came first.
+    if type(frames) is not int or frames < 0:
+        raise ValueError(f"{_LEGACY_VTU_FRAMES} must be a nonnegative integer")
+    if not settings["writeMeshVTUs"]:
+        return 0.0
+    if frames == 0:
+        raise ValueError(f"{_LEGACY_VTU_FRAMES} must be positive when mesh output is enabled")
+    span = settings["totalLoad"]
+    return max(100.0, frames / span) if span > 0 else 100.0
 
 
 def driven_normal(edge):
@@ -247,27 +262,37 @@ class Config:
         Path(path).write_text(self.text(self.folder_name(label)))
 
     @classmethod
-    def saved(cls, values, supplement=None, *, allow_legacy_vtu=False):
+    def saved(cls, values, supplement=None):
         """Resolve absent campaign settings without changing the saved identity."""
+        return cls._saved(values, supplement, allow_legacy_vtu=False)
+
+    @classmethod
+    def from_saved_settings(cls, values, supplement=None):
+        """Interpret recorded settings for analysis while retaining their identity."""
+        return cls._saved(values, supplement, allow_legacy_vtu=True)
+
+    @classmethod
+    def _saved(cls, values, supplement, *, allow_legacy_vtu):
         settings = values
-        legacy_vtu = allow_legacy_vtu and "nrVTUFrames" in values and "vtuFilesPerUnitLoad" not in values
+        legacy_vtu = allow_legacy_vtu and _LEGACY_VTU_FRAMES in values and "vtuFilesPerUnitLoad" not in values
         if legacy_vtu:
-            frames = values["nrVTUFrames"]
-            if type(frames) is not int or frames < 0:
-                raise ValueError("nrVTUFrames must be a nonnegative integer")
-            settings = {key: value for key, value in values.items() if key != "nrVTUFrames"}
+            settings = {key: value for key, value in values.items() if key != _LEGACY_VTU_FRAMES}
         missing = DEFAULTS.keys() - settings.keys() - cls.inactive_settings(settings)
         if supplement is None:
             supplement = {}
         if missing and not supplement:
             from .campaign import supplemental_settings
             supplement = supplemental_settings(values)
+        effective = supplement | settings
+        required = missing - effective.keys()
         if legacy_vtu:
-            supplement = {"vtuFilesPerUnitLoad": DEFAULTS["vtuFilesPerUnitLoad"]} | supplement
-        invalid = (missing - supplement.keys()) | (settings.keys() - DEFAULTS.keys())
+            required.discard("vtuFilesPerUnitLoad")
+        invalid = required | (settings.keys() - DEFAULTS.keys())
         if invalid:
             raise ValueError(f"Incomplete/unknown settings: {sorted(invalid)}")
-        effective = supplement | settings
+        if legacy_vtu:
+            rate = _legacy_vtu_rate(values[_LEGACY_VTU_FRAMES], effective)
+            effective.setdefault("vtuFilesPerUnitLoad", rate)
         edge = effective.get("drivenEdge")
         if effective.get("boundary") == "rectangle" and edge in RECTANGLE_EDGES:
             normal = driven_normal(edge)
@@ -277,12 +302,16 @@ class Config:
             elif effective.get(edge) == transverse:
                 effective[edge] = "fixed"
         result = cls(**effective)
-        result._original = {k: values[k] if k in (edge, "nrVTUFrames") else result[k] for k in values}
+        result._original = {k: values[k] if k == edge or k not in settings else result[k] for k in values}
         return result
 
     @classmethod
-    def parse_settings(cls, text, *, allow_legacy_vtu=False):
+    def parse_settings(cls, text):
         """Parse native configuration text without assigning a run identity."""
+        return cls._parse_settings(text, DEFAULTS)
+
+    @staticmethod
+    def _parse_settings(text, defaults):
         values = {}
         for line in text.splitlines():
             line = line.split("#", 1)[0].strip()
@@ -293,7 +322,6 @@ class Config:
                 raise ValueError(f"Duplicate setting: {key}")
             values[key] = value
         name = values.pop("name", None)
-        defaults = DEFAULTS | {"nrVTUFrames": 0} if allow_legacy_vtu else DEFAULTS
         for key in values:
             if key not in defaults:
                 raise ValueError(f"Unknown setting: {key}")
@@ -307,10 +335,19 @@ class Config:
         return name, values
 
     @classmethod
-    def read(cls, path, *, expected_name=None, allow_legacy_vtu=False):
+    def read(cls, path, *, expected_name=None):
         """Read original settings, resolving omissions through campaign metadata."""
-        name, values = cls.parse_settings(Path(path).read_text(), allow_legacy_vtu=allow_legacy_vtu)
-        result = cls.saved(values, allow_legacy_vtu=allow_legacy_vtu)
+        name, values = cls.parse_settings(Path(path).read_text())
+        return cls._check_saved_name(name, cls.saved(values), expected_name)
+
+    @classmethod
+    def read_saved(cls, path, *, expected_name=None):
+        """Read a recorded configuration for analysis or inventory."""
+        name, values = cls._parse_settings(Path(path).read_text(), DEFAULTS | {_LEGACY_VTU_FRAMES: 0})
+        return cls._check_saved_name(name, cls.from_saved_settings(values), expected_name)
+
+    @staticmethod
+    def _check_saved_name(name, result, expected_name):
         if name is None:
             raise ValueError("Missing saved configuration name")
         if name != result.folder_name(name.split("[")[0]):

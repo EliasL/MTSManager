@@ -19,7 +19,7 @@ from unittest.mock import patch
 from MTS_Management.cluster import Site, call, deploy, fetch_many, paths, serve, submit, sync_journals
 from MTS_Management.config import Config, DEFAULTS
 from MTS_Management.data import read_macros
-from MTS_Management.files import digest, file_digest, read_json, write_json
+from MTS_Management.files import digest, file_digest, locked, read_json, write_json
 from MTS_Management.inventory import estimate_size, inventory, progress, rebuild_index
 from MTS_Management.inventory_cache import snapshot as cached_inventory
 from MTS_Management.journal import Journal
@@ -88,13 +88,10 @@ class DeploymentTests(unittest.TestCase):
         versions = {"profiles": {"cluster": {"state": "mismatch", "identity": identity}}}
         source_record = {"branch": "main", "revision": "fixture", "source_sha256": expected["source"]}
         transferred = []
-        def archive(source, destination):
-            destination.write_bytes(b"verified source snapshot")
-            return source_record
         def transport(command, **kwargs):
             for argument in command:
-                if argument.endswith("/source.tar.gz"):
-                    transferred.append(Path(argument).read_bytes())
+                if argument.startswith("--files-from="):
+                    transferred.append(Path(argument.split("=", 1)[1]).read_bytes())
             return subprocess.CompletedProcess(command, 0, "", "")
         with tempfile.TemporaryDirectory() as temporary:
             sites = Path(temporary) / "sites.toml"
@@ -106,14 +103,14 @@ class DeploymentTests(unittest.TestCase):
                     patch("MTS_Management.deployments.call", return_value={"scripts": scripts_identity()}), \
                     patch("MTS_Management.cluster.call", return_value={"scripts": scripts_identity()}), \
                     patch("MTS_Management.cluster.source_identity", return_value=source_record), \
-                    patch("MTS_Management.cluster.source_archive", side_effect=archive):
+                    patch("MTS_Management.cluster.source_files", return_value=["src/main.cpp"]):
                 result = update_managers(sites, log=lambda _: None)
                 self.assertEqual(result["updated_sites"], ["cluster"])
                 self.assertEqual(transferred, [])
                 identity["source"] = "older-source"
                 result = update_managers(sites, log=lambda _: None)
                 self.assertEqual(result["updated_sites"], ["cluster"])
-                self.assertEqual(transferred, [b"verified source snapshot"])
+                self.assertEqual(transferred, [b"src/main.cpp\0"])
 
     def test_servers_update_concurrently_and_share_uploads_within_each_host(self):
         from MTS_Management.deployments import update_managers
@@ -276,7 +273,9 @@ print("finished",flush=True)
         exported = serve({"site": asdict(site), "operation": "inventory_update"})
         self.assertEqual(read_json(exported["snapshot"])["rows"][0]["attempt"], str(resumed))
         shutil.rmtree(folder)
-        self.assertEqual(inventory(self.output, hard_refresh=True), [])
+        missing, = inventory(self.output, hard_refresh=True)
+        self.assertEqual((missing["config_hash"], missing["status"]["state"]),
+                         (Config().config_hash, "missing"))
         self.assertEqual(cached_inventory(self.output)["pending"], [])
 
     def test_batch_inventory_refresh_reads_only_requested_runs_and_keeps_full_timestamp(self):
@@ -297,6 +296,43 @@ print("finished",flush=True)
         self.assertEqual(next(r for r in after["rows"] if r["config_hash"] == second.config_hash),
                          next(r for r in before if r["config_hash"] == second.config_hash))
         self.assertEqual(inventory(self.output, config_hashes=[], hard_refresh=True), [])
+
+    def test_inventory_refresh_survives_request_exit_and_publishes_complete_selection(self):
+        first, second = Config(seed=1), Config(seed=2)
+        folder = self.prepare(first).parents[1]
+        self.prepare(second)
+        site = Site(name="fixture", directory=str(self.root), output_root=str(self.output))
+        request = {"site": asdict(site), "operation": "inventory_refresh",
+                   "options": {"config_hashes": [first.config_hash]}}
+        with locked(self.output / ".inventory.lock"):
+            response = subprocess.run([sys.executable, "-m", "MTS_Management", "_serve"],
+                                      input=json.dumps(request), text=True, capture_output=True,
+                                      check=True, timeout=5)
+            self.assertEqual(json.loads(response.stdout)["state"], "started")
+            running = serve(request)
+            self.assertEqual(running["state"], "running")
+            self.assertNotIn("snapshot", running)
+            other_scope = serve(request | {"options": {}})
+            self.assertFalse(other_scope["same_scope"])
+
+        def wait_for_scan(payload):
+            deadline = time.monotonic() + 5
+            while (result := serve(payload))["state"] == "running" and time.monotonic() < deadline:
+                time.sleep(.02)
+            return result
+
+        response = wait_for_scan(request)
+        self.assertEqual(response["state"], "ready", response)
+        snapshot = response["snapshot"]
+        self.assertEqual([row["config_hash"] for row in snapshot["rows"]], [first.config_hash])
+        self.assertEqual(response, serve(request))
+
+        (folder / "config.conf").write_text("invalid configuration")
+        caught_up = request | {"options": request["options"] | {"known_revision": snapshot["revision"]}}
+        self.assertEqual(serve(caught_up)["state"], "started")
+        failure = wait_for_scan(caught_up)
+        self.assertEqual(failure["state"], "failed", failure)
+        self.assertEqual(serve(request), response)
 
     def test_inventory_cache_cannot_resurrect_finished_run_during_restart(self):
         attempt = self.prepare()
@@ -686,12 +722,19 @@ class DataTests(unittest.TestCase):
             self.assertFalse(partial["coverage_complete"])
             self.assertEqual(partial["entries_visited"], 5)
 
-    def test_progress_ignores_incomplete_last_row_and_counts_path_budget(self):
+    def test_progress_reads_load_and_durations_from_the_last_complete_row(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)/"macroData.csv"
-            path.write_text("load,x\n0.7,1\n1.2,2\n1.3,")
+            path.write_text("load,run_time,est_time_remaining\n"
+                            "0.7,0.120s,\n1.2,1d 2h 3m 4s,2m 5.125s\n1.3,")
             config = Config(startLoad=.7, totalLoad=1, directions="horizontal,-horizontal", segmentLoad=.1)
-            self.assertAlmostEqual(progress(folder, config)["fraction"], .5)
+            record = progress(folder, config)
+            self.assertAlmostEqual(record["fraction"], .5)
+            self.assertEqual((record["runtime_seconds"], record["remaining_seconds"]), (93784, 125.125))
+            path.write_text("load,x\n0.7,1\n1.2,2\n")
+            record = progress(folder, config)
+            self.assertIsNone(record["runtime_seconds"])
+            self.assertIsNone(record["remaining_seconds"])
             path.write_text("load,x\n0.7,1\n1.2\n")
             with self.assertRaises(ValueError):
                 progress(folder, config)

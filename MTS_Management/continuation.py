@@ -160,8 +160,8 @@ def source_run(root, selection, *, verify_inactive=False):
             config_path = folder / "config.conf"
             if config_path.is_symlink():
                 raise ExpectedError("The source run configuration must be a physical file.")
-            from .run_records import read_run
-            config, _ = read_run(folder)
+            from .run_records import read_run_for_execution
+            config, _ = read_run_for_execution(folder)
             if config.config_hash != selection["config_hash"]:
                 raise ExpectedError("The source run has an inconsistent configuration identity.")
             if verify_inactive:

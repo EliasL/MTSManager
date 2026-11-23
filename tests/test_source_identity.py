@@ -1,11 +1,12 @@
 """A fresh submodule must build without accepting source outside main history."""
 
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import unittest
 
-from MTS_Management.provenance import source_identity, source_hash, install_source, source_archive
+from MTS_Management.provenance import source_identity, source_hash, install_source
 from MTS_Management.files import write_json
 
 
@@ -19,17 +20,20 @@ class SourceIdentityTests(unittest.TestCase):
                 (directory / "src").mkdir(parents=True)
                 for name in files:
                     (directory / name).write_text(content)
+                unchanged = directory / "src/header.h"
+                unchanged.touch()
+                os.utime(unchanged, (1000 if directory == source else 2000,) * 2)
+                files.append("src/header.h")
                 write_json(directory / "SOURCE_FILES.json", files)
                 write_json(directory / "SOURCE.json", {"branch": "main", "revision": content,
                            "source_sha256": source_hash(directory)})
             (source / "build").mkdir()
             binary = source / "build/MTS2D"
             binary.write_bytes(b"retained old binary")
-            expected = source_archive(staged, staged / "source.tar.gz")
-            for name in ("src/main.cpp", "SOURCE_FILES.json", "SOURCE.json"):
-                (staged / name).unlink()
+            expected = source_identity(staged)
             install_source(source, staged, expected)
             self.assertEqual(source_identity(source), expected)
+            self.assertEqual((source / "src/header.h").stat().st_mtime, 1000)
             self.assertEqual(binary.read_bytes(), b"retained old binary")
             self.assertFalse((source / "src/old.cpp").exists())
             self.assertFalse(staged.exists())

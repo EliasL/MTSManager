@@ -24,7 +24,7 @@ from .provenance import (
     executable_identity, scripts_identity, retain_executable,
     supports_current_configuration, supports_initial_mesh,
 )
-from .run_records import read_run
+from .run_records import read_run_for_execution
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 ACTIVE = {"prepared", "queued", "running", "stopping"}
@@ -219,7 +219,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                 raise ValueError("Chain predecessor must be the latest submitted Slurm attempt")
         existing = manifest_path.exists()
         if existing:
-            saved, old = read_run(folder)
+            saved, old = read_run_for_execution(folder)
             if saved.config_hash != config.config_hash or saved.as_dict() != config.as_dict():
                 raise ValueError(f"Run manifest/configuration mismatch: {folder}")
             previous_statuses = [attempt_status(a) for a in (folder / "attempts").iterdir()]
@@ -237,7 +237,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             archived = archived_runs(output_root, {config.config_hash})
             if archived:
                 archived_folder = Path(archived[0]["folder"])
-                saved, _ = read_run(archived_folder)
+                saved, _ = read_run_for_execution(archived_folder)
                 if saved.config_hash != config.config_hash:
                     raise ValueError(f"Archived manifest/configuration mismatch: {archived_folder}")
                 if skip_completed and completed_run(archived_folder, saved):
@@ -459,7 +459,7 @@ def execute(attempt):
         try:
             if read_json(attempt / "status.json")["state"] not in {"prepared", "queued"}:
                 raise RuntimeError("Attempt has already executed or was cancelled")
-            config, _ = read_run(folder)
+            config, _ = read_run_for_execution(folder)
             if config.config_hash != request["config_hash"]:
                 raise ValueError("Configuration changed after submission")
             if executable_identity(request["executable"]) != request["build"]:

@@ -183,7 +183,7 @@ def _run_command(argv):
     if args.command == "inspect-run":
         from .run_records import read_run
 
-        config, manifest = read_run(args.folder, allow_legacy_vtu=True)
+        config, manifest = read_run(args.folder)
         print(json.dumps({"manifest": manifest, "effective_settings": config.effective_dict()}, indent=2,
                          allow_nan=False))
         return

@@ -40,6 +40,22 @@ without registering the campaign or submitting jobs. `inspect-run` reports a
 verified manifest and the effective settings for analysis. Both commands read
 local files and return JSON.
 
+For an interactive remote refresh, use
+`call(site, "inventory_refresh", known_revision=revision)`. Pass the revision
+of the last snapshot collected by the client, or omit it on the first call.
+The response state is `started`, `running`, `ready` or `failed`. A ready
+response includes a complete `snapshot` with `revision`, `rows` and
+`updated_at` (Unix seconds). Call again to collect the snapshot after a scan
+starts. A running scan reports its phase and, during run inspection, its
+checked and total run counts. Polling is driven by the caller.
+
+Pass `config_hashes` for a campaign selection, and keep each selection's
+revision independently. Pass `hard_refresh=True` to reread finished records
+and rebuild the index for a full-site selection. A failed response includes an
+error and a revision identifying the failed attempt. Pass that revision as
+`known_failure` to request a retry. `minimum_scan_start` optionally limits
+collection to snapshots whose scan began at or after a Unix timestamp.
+
 ## Submit explicitly
 
 After reviewing the configuration and site, pass a validated `Config` to
@@ -87,8 +103,8 @@ diagnostics and a nonzero exit.
 `read_run(folder)` returns the configuration and manifest after checking the
 folder name, configuration hash and recorded original settings.
 `config.as_dict()` gives identity-bearing settings. Use `config[key]` for
-the effective interpretation. Analysis and retrieval can use
-`allow_legacy_vtu=True` for native MTS runs recorded before the snapshot rate
-was introduced. Use normal configuration validation when preparing a fresh
-execution. See the [simulation process](../docs/TheSimulationProcess.md) for
+the effective interpretation. `Config.read_saved(path)` reads a standalone
+recorded configuration. `saved_campaign_entries(path)` reads a recorded
+campaign for analysis. Use `Config.read` and `campaign_entries` for
+submission. See the [simulation process](../docs/TheSimulationProcess.md) for
 checkpoint recovery and run records.

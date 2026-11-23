@@ -2,8 +2,6 @@
 
 from pathlib import Path
 import os
-import io
-import tarfile
 import shutil
 import tempfile
 import re
@@ -130,40 +128,11 @@ def retain_executable(executable, archive_dir):
     return destination / "MTS2D"
 
 
-def source_archive(source, destination):
-    """Package verified build inputs as one compressed transfer."""
-    source = Path(source).resolve()
-    identity = source_identity(source)
-    files = source_files(source)
-    from .files import canonical
-    with tarfile.open(destination, "w:gz", dereference=True) as archive:
-        for name in files:
-            archive.add(source / name, arcname=name, recursive=False)
-        for name, value in (("SOURCE.json", identity), ("SOURCE_FILES.json", files)):
-            data = canonical(value)
-            entry = tarfile.TarInfo(name)
-            entry.size = len(data)
-            entry.mode = 0o644
-            archive.addfile(entry, io.BytesIO(data))
-    if source_identity(source) != identity:
-        raise RuntimeError("Source changed while preparing its upload")
-    return identity
-
-
 def install_source(source, staging, expected):
     """Update one managed source snapshot while preserving external build artifacts."""
     source, staging = Path(source).resolve(), Path(staging).resolve()
     if staging.parent != source.parent or not staging.name.startswith(".mts-source-upload-"):
         raise ValueError("Source staging directory is outside the configured source workspace")
-    if (staging / "source.tar.gz").exists():
-        with tarfile.open(staging / "source.tar.gz", "r:gz") as archive:
-            members = archive.getmembers()
-            if any(not (member.isfile() or member.isdir()) or
-                   not (staging / member.name).resolve().is_relative_to(staging) for member in members):
-                raise ValueError("Uploaded source archive contains an unsafe path or link")
-            archive.extractall(staging, members=members)
-    if source_identity(staging) != expected:
-        raise ValueError("Uploaded source does not match the requested source identity")
     new_files = source_files(staging)
     new_names = set(new_files)
     with locked(source.parent / ".source.lock"):
@@ -171,7 +140,6 @@ def install_source(source, staging, expected):
             raise ValueError("Update Git checkouts with Git; source uploads require a managed snapshot")
         old_files = []
         if source.exists():
-            source_identity(source)
             old_files = source_files(source)
         for name in set(old_files) | new_names:
             relative = Path(name)
@@ -181,11 +149,19 @@ def install_source(source, staging, expected):
                 raise ValueError("Source manifest follows a symlink outside the source tree")
             if name in new_names and not (staging / relative).resolve().is_relative_to(staging):
                 raise ValueError("Uploaded source follows a symlink outside its staging directory")
+        if source_identity(staging) != expected:
+            raise ValueError("Uploaded source does not match the requested source identity")
+        if source.exists():
+            source_identity(source)
         source.mkdir(parents=True, exist_ok=True)
         for name in new_files:
             destination = source / name
+            incoming = staging / name
+            if destination.is_file() and file_digest(destination) == file_digest(incoming):
+                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(staging / name, destination)
+            # Changed inputs need an installation timestamp to invalidate older objects.
+            shutil.copy(incoming, destination)
         for name in set(old_files) - new_names:
             (source / name).unlink()
         write_json(source / "SOURCE_FILES.json", new_files)

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from MTS_Management.cluster import Site, call
 from MTS_Management.config import Config
-from MTS_Management.files import write_json
+from MTS_Management.files import digest, read_json, write_json
 from MTS_Management.slurm_control import matches, remote, validate_rule
 
 
@@ -74,6 +74,34 @@ class SlurmControlTests(unittest.TestCase):
         self.assertEqual(result['command'], '')
         self.assertEqual(self.jobs['101']['reason'], 'Priority')
         self.assertFalse((self.root / '.state/job-log.jsonl').exists())
+
+    def test_release_review_matches_verified_legacy_saved_settings(self):
+        folder = self.output / self.jobs['104']['name']
+        manifest = read_json(folder / 'manifest.json')
+        settings = manifest['settings']
+        settings.pop('vtuFilesPerUnitLoad')
+        settings.update(nrVTUFrames=500, writeMeshVTUs=True, totalLoad=2.0)
+        identity = digest({"format": "mtscripts-config-v1", "settings": settings})
+        name = f"LegacyL800[{identity[:20]}]"
+        index_path = self.output / '.run-index.json'
+        index = read_json(index_path)
+        del index[manifest['config_hash']]
+        write_json(index_path, index | {identity: name})
+        folder.rename(self.output / name)
+        folder = self.output / name
+        self.jobs['104']['name'] = name
+        lines = [f'{key} = {str(value).lower() if type(value) is bool else value}' for key, value in settings.items()]
+        (folder / 'config.conf').write_text(f'name = {name}\n' + '\n'.join(lines) + '\n')
+        write_json(folder / 'manifest.json', manifest | {'config_hash': identity})
+        rule = self.rule | {'action': 'release', 'criteria': self.rule['criteria'] + [
+            dict(field='vtuFilesPerUnitLoad', operator='eq', value=250.0)]}
+        payload = self.payload | {'options': {'rule': rule}}
+        with patch('MTS_Management.slurm_control.queue', return_value=self.jobs):
+            plan = remote(payload)
+            self.assertEqual([(job['job_id'], job['config_hash']) for job in plan['jobs']], [('104', identity)])
+            write_json(folder / 'manifest.json', manifest | {'config_hash': identity, 'settings': settings | {'seed': 99}})
+            with self.assertRaisesRegex(ValueError, 'Manifest/configuration mismatch'):
+                remote(payload)
 
     def test_any_all_criteria_and_client_program_transport(self):
         config = Config(rows=800, cols=800, reconnectionMethod='none')

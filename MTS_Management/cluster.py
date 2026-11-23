@@ -23,9 +23,10 @@ from .files import canonical, digest, file_digest, locked, now, read_json, write
 from .initial_mesh import MESH_FILE, verify_mesh
 from .inventory import inventory, rebuild_index, remove_missing, resources
 from .inventory_cache import export as export_inventory, snapshot as cached_inventory
+from .inventory_refresh import request_refresh
 from .journal import Journal
 from .processes import wait_cancellable
-from .provenance import build, install_source, source_archive, source_files, source_identity, executable_identity
+from .provenance import build, install_source, source_files, source_identity, executable_identity
 from .run_records import read_run
 from .runner import PACKAGE_ROOT, RunConflict, attempt_log_tail, find_fresh_conflict, launch, prepare, stop
 
@@ -141,6 +142,8 @@ def serve(payload, *, cancel=None, log=None):
         return rebuild_index(p["output_root"])
     if op == "inventory":
         return inventory(p["output_root"], cancel=cancel, **options)
+    if op == "inventory_refresh":
+        return request_refresh(p["output_root"], **options)
     if op == "mesh_snapshots":
         from .data import mesh_snapshots
         folder = Path(options["folder"])
@@ -293,7 +296,7 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, *
     python = [site.python, '-u', '-m', module, '_serve']
     if _program is not None:
         python = [site.python, '-u', '-c', "import json,sys; __mts_control_request=json.load(sys.stdin); exec(__mts_control_request.pop('program'))"]
-    reader = site.ssh and operation in {"inventory", "inventory_cached", "inventory_update", "logs"}
+    reader = site.ssh and operation in {"inventory", "inventory_cached", "inventory_update", "inventory_refresh", "logs"}
     if reader:
         payload["reader_timeout"] = max(1, int(timeout))
     if manager_directory:
@@ -534,12 +537,25 @@ def deploy(site, *, include_source=False, local_source=None):
     if include_source:
         staging = remote_source.parent / (".mts-source-upload-" + secrets.token_hex(8))
         target = f"{site.ssh}:{shlex.quote(str(staging))}/"
-        subprocess.run(["ssh", "-T", site.ssh, "mkdir -p -- " + shlex.quote(str(staging))], check=True)
+        # Use a fixed relative basis name so remote source paths need quoting only in SSH.
+        command = ("umask 077; mkdir -p -- " + shlex.quote(str(staging)) +
+                   " && ln -s -- " + shlex.quote(str(remote_source)) + " " +
+                   shlex.quote(str(staging / ".basis")))
+        subprocess.run(["ssh", "-T", site.ssh, command], check=True)
+        local_source = Path(local_source).resolve()
+        files = source_files(local_source)
         with tempfile.TemporaryDirectory() as temporary:
-            archive = Path(temporary) / "source.tar.gz"
-            if source_archive(local_source, archive) != source_record:
+            records = Path(temporary)
+            listing = records / "files"
+            listing.write_bytes(b"".join(os.fsencode(name) + b"\0" for name in files))
+            subprocess.run(["rsync", "-aLc0", "-e", "ssh -T", "--copy-dest=.basis",
+                            f"--files-from={listing}", str(local_source) + "/", target], check=True)
+            if source_identity(local_source) != source_record:
                 raise RuntimeError("Source changed during deployment")
-            subprocess.run(["rsync", "-a", "-e", "ssh -T", str(archive), target], check=True)
+            write_json(records / "SOURCE.json", source_record)
+            write_json(records / "SOURCE_FILES.json", files)
+            subprocess.run(["rsync", "-a", "-e", "ssh -T", str(records / "SOURCE.json"),
+                            str(records / "SOURCE_FILES.json"), target], check=True)
         call(site, "install_source", staging=str(staging), expected=source_record, timeout=120)
     return {"site": site.name, "directory": directory, "source": source_record,
             "remote": call(site, "info")}
@@ -550,7 +566,8 @@ def fetch(site, config_hash, destination, *, kind="macro"):
 
 
 def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only=False,
-               expected_manifests=None, retain_binaries=True, mesh_frames=None, cancel=None):
+               expected_manifests=None, retain_binaries=True, mesh_frames=None, cancel=None,
+               inventory_timeout=30, receipt_path=None, force_transfer=False):
     """Validate one inventory, then transfer selected runs in one rsync call.
 
     completed_only skips absent/not-yet-terminated campaign members explicitly.
@@ -570,11 +587,13 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     if not hashes:
         return []
     options = {"config_hashes": hashes} if all(len(h) == 64 for h in hashes) else {}
-    available = call(site, "inventory", cancel=cancel, **options)
+    available = call(site, "inventory", timeout=inventory_timeout, cancel=cancel, **options)
     selected = {}
     for prefix in hashes:
         matches = [r for r in available if r["config_hash"].startswith(prefix) and not r.get("missing")]
-        if len(matches) > 1 or (not matches and not completed_only):
+        if not matches and not completed_only:
+            raise ExpectedError(f"No available run for {prefix}. Refresh Monitor data and try again.")
+        if len(matches) > 1:
             raise ValueError(f"Expected one run for {prefix}; found {len(matches)}")
         if matches and (not completed_only or matches[0].get("termination") is not None):
             row = matches[0]
@@ -586,7 +605,6 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
         return []
     if expected_manifests is not None and any(
             expected_manifests.get(r["config_hash"]) != r["manifest_sha256"] for r in rows):
-        from .errors import ExpectedError
         raise ExpectedError("The remote run identity changed. Refresh Monitor data and try again.")
     if mesh_frames is None:
         from .campaign import install_campaign_files
@@ -609,7 +627,8 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
         if target.exists() and any(target.iterdir()):
             manifest = target / "manifest.json"
             if not manifest.exists() or file_digest(manifest) != row["manifest_sha256"]:
-                raise ValueError(f"Download destination contains a different/unmanaged run: {target}")
+                raise ExpectedError(f"Download destination contains a different/unmanaged run: {target}. "
+                                    "Choose a separate local collection.")
     destination.mkdir(parents=True, exist_ok=True)
     origin = f"{site.ssh}:{shlex.quote(str(root))}/" if site.ssh else str(root) + "/"
     filters = (["--include=/*/", "--include=macroData.csv", "--include=config.conf",
@@ -626,8 +645,9 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
     with tempfile.TemporaryDirectory() as temporary:
         listing = Path(temporary) / "runs.txt"
         listing.write_text("".join(files))
+        transfer_options = ["--ignore-times"] if force_transfer else []
         command = ["rsync", "-ar", "-e", "ssh -T", "--files-from=" + str(listing),
-                   *filters, origin, str(destination) + "/"]
+                   *transfer_options, *filters, origin, str(destination) + "/"]
         if cancel is None:
             subprocess.run(command, check=True)
         else:
@@ -642,14 +662,14 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
         target = destination / Path(row["folder"]).name
         if file_digest(target / "manifest.json") != row["manifest_sha256"]:
             raise ValueError(f"Transferred manifest differs from inventory: {target}")
-        config, _ = read_run(target, allow_legacy_vtu=True)
+        config, _ = read_run(target)
         if config.config_hash != row["config_hash"]:
             raise ValueError(f"Transferred configuration differs from inventory: {target}")
         if mesh_frames is None:
             verify_mesh(target, config)
         if row.get("termination") is None:
             (target / "termination.json").unlink(missing_ok=True)
-    write_json(destination / "snapshot.json", dict(fetched_at=now(), site=site.name,
+    write_json(receipt_path or destination / "snapshot.json", dict(fetched_at=now(), site=site.name,
                source_root=str(root), kind=kind if mesh_frames is None else "mesh", runs=[dict(config_hash=r["config_hash"],
                manifest_sha256=r["manifest_sha256"]) for r in rows]))
     return [str(destination / Path(r["folder"]).name) for r in rows]

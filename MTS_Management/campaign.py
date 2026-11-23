@@ -7,14 +7,32 @@ from pathlib import Path
 from functools import lru_cache
 
 
-def campaign_entries(path, *, allow_legacy_vtu=False):
+def campaign_entries(path):
+    """Read a campaign for submission using the current execution schema."""
+    return _read_campaign(path, Config.saved)
+
+
+def saved_campaign_entries(path):
+    """Interpret a recorded campaign for analysis and retain its run identities."""
+    return _read_campaign(path, Config.from_saved_settings)
+
+
+def campaign_member(record, name, planned_hashes):
+    return record["config_hash"] in planned_hashes or (name is not None and record.get("campaign") == name)
+
+
+def _read_campaign(path, read_settings):
     metadata = Path(path).with_name("metadata.json")
     supplement = read_json(metadata).get("missing_settings", {}) if metadata.exists() else {}
-    return validate_campaign(read_json(path), supplement, allow_legacy_vtu=allow_legacy_vtu)
+    return _validate_campaign(read_json(path), supplement, read_settings)
 
 
-def validate_campaign(data, supplement=None, *, allow_legacy_vtu=False):
+def validate_campaign(data, supplement=None):
     """Validate a campaign definition and return its name and labelled configurations."""
+    return _validate_campaign(data, supplement, Config.saved)
+
+
+def _validate_campaign(data, supplement, read_settings):
     if data.keys() != {"name", "runs"} or not data["runs"]:
         raise ValueError("Campaign requires name and nonempty runs")
     result = []
@@ -22,7 +40,7 @@ def validate_campaign(data, supplement=None, *, allow_legacy_vtu=False):
     for entry in data["runs"]:
         if entry.keys() != {"label", "settings"}:
             raise ValueError("Campaign runs require label and complete settings")
-        config = Config.saved(entry["settings"], supplement, allow_legacy_vtu=allow_legacy_vtu)
+        config = read_settings(entry["settings"], supplement)
         if entry["settings"].keys() != config.as_dict().keys():
             raise ValueError("Campaign settings must be complete")
         config.folder_name(entry["label"])
@@ -121,6 +139,9 @@ def install_campaign_files(records):
             path = directory / name
             if name == "metadata.json" and path.exists():
                 data = dict(data)
-                local = read_json(path).get("executables", [])
+                previous = read_json(path)
+                local = previous.get("executables", [])
                 data["executables"] = local + [e for e in data.get("executables", []) if e not in local]
+                if "sweep" in previous:
+                    data.setdefault("sweep", previous["sweep"])
             write_json(path, data)

@@ -163,8 +163,8 @@ transferring files, and matching profiles are skipped. `--host cluster` selects
 one SSH destination. `mts update-managers --force` updates all enabled destinations
 without skipping current versions; force is available only outside the GUI.
 Component comparisons also skip an unchanged simulator source when updating
-manager code or campaign definitions. A source archive is created and installed
-only when its recorded checksum differs or the update is forced.
+manager code or campaign definitions. When the source needs updating, rsync
+transfers the listed build inputs using the installed snapshot as its basis.
 
 Submission records and `.state/job-log.jsonl` identify requests, accepted jobs
 and administrative actions. Each attempt saves the original command, environment

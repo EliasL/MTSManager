@@ -10,7 +10,7 @@ import shlex
 import subprocess
 import sys
 
-from MTS_Management.config import Config, DEFAULTS
+from MTS_Management.config import DEFAULTS
 from MTS_Management.files import read_json
 
 ACTIONS = {"hold": "Hold queued jobs", "release": "Release user-held jobs", "cancel": "Cancel queued jobs"}
@@ -81,6 +81,8 @@ def command(action, ids):
 def remote(payload):
     from MTS_Management.cluster import Site, paths
     from MTS_Management.journal import Journal
+    from MTS_Management.run_records import read_run
+
     site = Site(**payload["site"])
     if site.mode != "slurm":
         raise ValueError("This profile does not use Slurm.")
@@ -103,11 +105,9 @@ def remote(payload):
         folder = root / job["name"]
         if folder.parent != root:
             raise ValueError("Run index contains an invalid folder path.")
-        config = Config.read(folder / "config.conf", expected_name=folder.name)
-        manifest = read_json(folder / "manifest.json")
-        if (config.config_hash != by_name[folder.name] or manifest["config_hash"] != config.config_hash
-                or manifest["settings"] != config.as_dict()):
-            raise ValueError(f"Configuration identity mismatch: {folder}")
+        config, manifest = read_run(folder)
+        if config.config_hash != by_name[folder.name]:
+            raise ValueError(f"Index/configuration mismatch: {folder}")
         if not matches(config, manifest, rule):
             continue
         owned = any(str(read_json(a / "status.json").get("scheduler_id")) == job["job_id"] for a in (folder / "attempts").iterdir())

@@ -159,7 +159,7 @@ def restore_simulation(output_root, state_dir, row, *, downloaded=False):
             raise ExpectedError(f"The archived run is unavailable or its identity changed: {archived}")
         if not downloaded:
             from .run_records import read_run
-            config, _ = read_run(archived, expected_name=original.name, allow_legacy_vtu=True)
+            config, _ = read_run(archived, expected_name=original.name)
             if config.config_hash != identity:
                 raise ValueError(f"Archived configuration identity changed: {archived}")
             index = read_json(index_file) if index_file.exists() else {}

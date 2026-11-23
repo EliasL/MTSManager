@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import time
 
-from .data import last_macro_row
+from .data import duration_seconds, last_macro_row
 
 from .files import file_digest, locked, now, read_json, write_json
 from .inventory_cache import invalidate, publish, records
@@ -24,15 +24,20 @@ def progress(folder, config, limit=65536):
     path = Path(folder) / "macroData.csv"
     values = last_macro_row(path, limit=limit)
     if values is None:
-        return {"load": None, "fraction": None}
+        return {"load": None, "fraction": None, "runtime_seconds": None, "remaining_seconds": None}
     load = float(values["load"])
     if not math.isfinite(load):
         raise ValueError(f"Non-finite load: {path}")
     fraction = ((load-config["startLoad"])/config["totalLoad"]
                 if config["totalLoad"] else 1.0)
+    runtime = values.get("run_time", "").strip() or None
+    remaining = values.get("est_time_remaining", "").strip() or None
+    stat = path.stat()
     return {"load": load, "fraction": min(1.0, max(0.0, fraction)),
-            "csv_modified": path.stat().st_mtime,
-            "estimated_remaining": values.get("est_time_remaining")}
+            "csv_modified": stat.st_mtime, "csv_size": stat.st_size,
+            "runtime": runtime, "estimated_remaining": remaining,
+            "runtime_seconds": duration_seconds(runtime) if runtime is not None else None,
+            "remaining_seconds": duration_seconds(remaining) if remaining is not None else None}
 
 
 def estimate_size(folder, *, max_entries=10000, seconds=0.2, samples=5):
@@ -83,7 +88,7 @@ def rebuild_index(output_root, *, keep_missing=False):
         for folder in root.iterdir():
             if not folder.is_dir() or not (folder / "manifest.json").exists():
                 continue
-            config, _ = read_run(folder, allow_legacy_vtu=True)
+            config, _ = read_run(folder)
             if config.config_hash in index:
                 raise ValueError(f"Duplicate configuration directories: {folder}")
             index[config.config_hash] = folder.name
@@ -118,13 +123,19 @@ def remove_missing(output_root, runs):
     return removed
 
 
+def validate_config_hashes(config_hashes):
+    if not isinstance(config_hashes, list) or any(
+            not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h)
+            for h in config_hashes):
+        raise ValueError("config_hashes requires a list of full configuration hashes")
+
+
 def inventory(output_root, *, config_hash=None, config_hashes=None, refresh_sizes=False, hard_refresh=False,
-              include_archived=False, cancel=None):
+              include_archived=False, cancel=None, report=None):
     if config_hashes is not None:
-        if config_hash is not None or not isinstance(config_hashes, list) or any(
-                not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h)
-                for h in config_hashes):
+        if config_hash is not None:
             raise ValueError("config_hashes requires a list of full configuration hashes, without config_hash")
+        validate_config_hashes(config_hashes)
         if not config_hashes:
             return []
     root = Path(output_root).resolve()
@@ -134,17 +145,21 @@ def inventory(output_root, *, config_hash=None, config_hashes=None, refresh_size
     if not index_file.exists() or (hard_refresh and config_hash is None and config_hashes is None):
         rebuild_index(root, keep_missing=True)
     # Serialise refreshes, without blocking lifecycle invalidation or cached readers.
+    if report:
+        report("Waiting for inventory access")
     with locked(root / ".inventory.lock", cancel=cancel):
         rows = _inventory(root, config_hash=config_hash, config_hashes=config_hashes, refresh_sizes=refresh_sizes,
-                          hard_refresh=hard_refresh, cancel=cancel)
+                          hard_refresh=hard_refresh, cancel=cancel, report=report)
         if include_archived:
             from .archive import archived_runs
+            if report:
+                report("Checking archives")
             rows.extend(row for row in archived_runs(root, config_hashes)
                         if not config_hash or row["config_hash"].startswith(config_hash))
         return rows
 
 
-def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh, cancel):
+def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh, cancel, report):
     index = read_json(root / ".run-index.json")
     if config_hash and (len(config_hash) < 20 or any(c not in "0123456789abcdef" for c in config_hash)):
         raise ValueError("Use at least the complete 20-character configuration hash")
@@ -156,7 +171,9 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
         matches = [h for h in index if h in requested]
     cached = records(root, hashes=matches if config_hash or config_hashes is not None else None)
     result, updates, revisions = [], [], {}
-    for h in matches:
+    for checked, h in enumerate(matches):
+        if report:
+            report("Checking simulations", checked, len(matches))
         if cancel is not None and cancel.is_set():
             raise CancelledError("Inventory aborted")
         folder = root / index[h]
@@ -177,11 +194,12 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
             continue
         if (not hard_refresh and not refresh_sizes and row is not None and row["folder"] == str(folder)
                 and "run_date" in row
+                and {"runtime_seconds", "remaining_seconds"} <= row["progress"].keys()
                 and row["status"]["state"] == "finished" and not row["queued_continuations"]
                 and row.get("settings_metadata") == config_metadata_stamp()):
             result.append(row)
             continue
-        config, manifest = read_run(folder, allow_legacy_vtu=True)
+        config, manifest = read_run(folder)
         if config.config_hash != h:
             raise ValueError(f"Index/config mismatch: {folder}")
         requests = {attempt: read_json(attempt / "request.json") for attempt in (folder / "attempts").iterdir()}

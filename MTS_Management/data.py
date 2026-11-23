@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 
@@ -11,6 +12,21 @@ from .files import digest
 
 
 MESH_SNAPSHOT = re.compile(r".*_load=(?P<load>[-+\d.eE]+)_nrM=(?P<plastic>\d+)_\.(?P<step>\d+)\.vtu")
+
+
+def duration_seconds(value):
+    """Parse the native simulator's duration text."""
+    tokens = value.split()
+    if not tokens or any(not re.fullmatch(r"\d+(?:\.\d+)?[dhms]", token) for token in tokens):
+        raise ValueError(f"Invalid simulator duration: {value!r}")
+    units = [token[-1] for token in tokens]
+    if len(set(units)) != len(units) or units != sorted(units, key="dhms".index):
+        raise ValueError(f"Invalid duration unit order: {value!r}")
+    seconds = sum(float(token[:-1]) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[token[-1]]
+                  for token in tokens)
+    if not math.isfinite(seconds):
+        raise ValueError(f"Non-finite simulator duration: {value!r}")
+    return seconds
 
 
 def mesh_snapshots(folder, *, through_step=None):
