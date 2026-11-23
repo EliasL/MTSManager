@@ -8,13 +8,13 @@ import os
 from pathlib import Path
 import sys
 
-from .cluster import across, call, deploy, fetch, load_sites, paths, serve, submit, sync_journals
-from .campaign import campaign_entries
+from .cluster import across, call, deploy, fetch, load_sites, serve, sync_journals
 from .config import Config, sweep
 from .errors import EXPECTED_ERROR_EXIT, EXPECTED_ERROR_FORMAT, ExpectedError
-from .files import read_json, write_json
+from .files import write_json
 from .journal import Journal
-from .runner import RunConflict, execute, launch, prepare, run_many
+from .runner import execute
+from .submission import submission_state_dir, submit_campaign, submit_run
 from .status import render, watch
 
 
@@ -51,6 +51,10 @@ def parser():
     c.add_argument("--name", required=True)
     c.add_argument("--base", type=Path, required=True)
     c.add_argument("--vary", action="append", required=True, help="e.g. 'seed=[0,1,2]'")
+    c = commands.add_parser("validate-campaign", help="Validate a saved campaign and report its configuration identities")
+    c.add_argument("path", type=Path)
+    c = commands.add_parser("inspect-run", help="Verify a local native configuration and run manifest")
+    c.add_argument("folder", type=Path)
     c = commands.add_parser("update-managers", help="Update outdated remote MTS installations")
     c.add_argument("--host", help="Limit the update to one SSH destination")
     c.add_argument("--force", action="store_true", help="Update even when installed versions match")
@@ -168,10 +172,23 @@ def _run_command(argv):
                 write_json(companion, {"missing_settings": {}, "executables": []} if name == "metadata.json" else {})
         print(f"Wrote {len(entries)} configurations to {args.path}")
         return
+    if args.command == "validate-campaign":
+        from .campaign import campaign_entries
+
+        name, entries = campaign_entries(args.path)
+        print(json.dumps({"campaign": name, "members": [
+            {"label": label, "config_hash": config.config_hash, "folder_name": config.folder_name(label)}
+            for config, label in entries]}, indent=2))
+        return
+    if args.command == "inspect-run":
+        from .run_records import read_run
+
+        config, manifest = read_run(args.folder, allow_legacy_vtu=True)
+        print(json.dumps({"manifest": manifest, "effective_settings": config.effective_dict()}, indent=2,
+                         allow_nan=False))
+        return
     sites = load_sites(args.sites)
-    state_dir = (args.state_dir.resolve() if args.state_dir else
-                 Path(paths(sites["local"])["state_dir"]) if "local" in sites else
-                 args.sites.resolve().parent / ".state")
+    state_dir = args.state_dir.resolve() if args.state_dir else submission_state_dir(args.sites, sites)
     if args.command in {"status", "sync-log", "find"}:
         names = args.site or list(sites)
         selected = [sites[name] for name in names]
@@ -195,76 +212,16 @@ def _run_command(argv):
     if args.command in {"run", "campaign"}:
         if args.mode:
             site = replace(site, mode=args.mode)
-        if args.chain < 1 or (args.chain > 1 and site.mode != "slurm"):
-            raise ValueError("--chain requires a positive count and Slurm for multiple jobs")
-        resource_plan = {}
-        if args.command == "campaign":
-            from .campaign import install_campaign_files
-            records = {p.name: read_json(p) for p in
-                       (args.path, args.path.with_name("resources.json"), args.path.with_name("metadata.json"))
-                       if p.exists()}
-            records["simulations.json"] = records.pop(args.path.name)
-            install_campaign_files([records])
-            resource_plan = records.get("resources.json", {}).get("resources", {})
-            if site.ssh:
-                call(site, "install_campaign_files", records=[records])
-        campaign, entries = ((args.campaign, [(Config.read(args.path), args.label)])
-                             if args.command == "run" else campaign_entries(args.path))
-        initial_mesh = None
-        if args.command == "run" and args.initial_mesh is not None:
-            from .initial_mesh import MAX_MESH_BYTES, mesh_checksum
-            config, label = entries[0]
-            with args.initial_mesh.open("rb") as stream:
-                initial_mesh = stream.read(MAX_MESH_BYTES + 1)
-            if len(initial_mesh) > MAX_MESH_BYTES:
-                raise ExpectedError("The initial VTU must be at most 16 MiB.")
-            try:
-                initial_mesh = initial_mesh.decode("ascii")
-            except UnicodeDecodeError as error:
-                raise ExpectedError("Supply an ASCII VTU file for the initial mesh.") from error
-            checksum = mesh_checksum(initial_mesh)
-            if config["initialMeshSha256"] and config["initialMeshSha256"] != checksum:
-                raise ExpectedError("The initial mesh checksum differs from config.conf.")
-            config = Config(**(config.as_dict() | {"initialMeshSha256": checksum}))
-            entries = [(config, label)]
-        if not site.ssh and site.mode == "foreground":
-            p = paths(site)
-            attempts, skipped, conflicts = [], [], []
-            try:
-                for config, label in entries:
-                    try:
-                        attempt = prepare(config, executable=p["executable"], output_root=p["output_root"],
-                            state_dir=p["state_dir"], campaign=campaign, label=label,
-                            checkpoint=args.checkpoint if args.command == "run" else None, site=site.name,
-                            environment=site.environment, initial_mesh=initial_mesh,
-                            skip_completed=args.command == "campaign")
-                    except RunConflict as error:
-                        if args.command == "run":
-                            raise
-                        conflicts.append({"label": label, "config_hash": config.config_hash,
-                                          "conflict": str(error)})
-                        continue
-                    if attempt is None:
-                        skipped.append({"label": label, "config_hash": config.config_hash})
-                    else:
-                        attempts.append(attempt)
-            except BaseException:
-                from .runner import set_status
-                for attempt in attempts:
-                    set_status(attempt, "stopped", reason="Batch preparation failed")
-                raise
-            if args.command == "run":
-                result = launch(attempts[0])
+        with redirect_stdout(sys.stderr):
+            if args.command == "campaign":
+                result = submit_campaign(site, args.path, state_dir=state_dir, chain=args.chain, workers=args.workers)
             else:
-                if attempts:
-                    run_many(attempts, args.workers)
-                result = {"attempts": list(map(str, attempts)), "skipped": skipped, "conflicts": conflicts}
-        else:
-            result = [submit(replace(site, slurm=site.slurm | resource_plan.get(str(config["rows"]), {})), config, state_dir=state_dir, campaign=campaign, label=label,
-                             checkpoint=args.checkpoint if args.command == "run" else None,
-                             chain=args.chain, initial_mesh=initial_mesh,
-                             skip_completed=args.command == "campaign")
-                      for config, label in entries]
+                from .initial_mesh import read_mesh
+
+                initial_mesh = read_mesh(args.initial_mesh) if args.initial_mesh is not None else None
+                result = submit_run(site, Config.read(args.path), state_dir=state_dir, campaign=args.campaign,
+                                    label=args.label, checkpoint=args.checkpoint, chain=args.chain,
+                                    initial_mesh=initial_mesh)
     elif args.command == "deploy":
         result = deploy(site, include_source=args.source is not None, local_source=args.source)
     elif args.command == "build":

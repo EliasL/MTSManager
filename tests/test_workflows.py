@@ -263,7 +263,7 @@ print("finished",flush=True)
         self.assertEqual(names.count("request.json"), 1)
         folder = attempt.parents[1]
         (folder / "macroData.csv").write_text("load,value\n0,1\n0.75,2\n")
-        with patch("MTS_Management.inventory.Config.read", side_effect=AssertionError("Finished run reread")):
+        with patch("MTS_Management.inventory.read_run", side_effect=AssertionError("Finished run reread")):
             self.assertEqual(inventory(self.output), first)
         self.assertEqual(inventory(self.output, hard_refresh=True)[0]["progress"]["fraction"], .75)
         self.assertIsNotNone(cached_inventory(self.output)["updated_at"])

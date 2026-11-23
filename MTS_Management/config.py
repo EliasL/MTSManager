@@ -247,17 +247,27 @@ class Config:
         Path(path).write_text(self.text(self.folder_name(label)))
 
     @classmethod
-    def saved(cls, values, supplement=None):
+    def saved(cls, values, supplement=None, *, allow_legacy_vtu=False):
         """Resolve absent campaign settings without changing the saved identity."""
-        missing = DEFAULTS.keys() - values.keys() - cls.inactive_settings(values)
+        settings = values
+        legacy_vtu = allow_legacy_vtu and "nrVTUFrames" in values and "vtuFilesPerUnitLoad" not in values
+        if legacy_vtu:
+            frames = values["nrVTUFrames"]
+            if type(frames) is not int or frames < 0:
+                raise ValueError("nrVTUFrames must be a nonnegative integer")
+            settings = {key: value for key, value in values.items() if key != "nrVTUFrames"}
+        missing = DEFAULTS.keys() - settings.keys() - cls.inactive_settings(settings)
         if supplement is None:
             supplement = {}
         if missing and not supplement:
             from .campaign import supplemental_settings
             supplement = supplemental_settings(values)
-        if missing - supplement.keys() or values.keys() - DEFAULTS.keys():
-            raise ValueError(f"Incomplete/unknown settings: {sorted((missing - supplement.keys()) | (values.keys() - DEFAULTS.keys()))}")
-        effective = supplement | values
+        if legacy_vtu:
+            supplement = {"vtuFilesPerUnitLoad": DEFAULTS["vtuFilesPerUnitLoad"]} | supplement
+        invalid = (missing - supplement.keys()) | (settings.keys() - DEFAULTS.keys())
+        if invalid:
+            raise ValueError(f"Incomplete/unknown settings: {sorted(invalid)}")
+        effective = supplement | settings
         edge = effective.get("drivenEdge")
         if effective.get("boundary") == "rectangle" and edge in RECTANGLE_EDGES:
             normal = driven_normal(edge)
@@ -267,11 +277,11 @@ class Config:
             elif effective.get(edge) == transverse:
                 effective[edge] = "fixed"
         result = cls(**effective)
-        result._original = {k: values[k] if k == edge else result[k] for k in values}
+        result._original = {k: values[k] if k in (edge, "nrVTUFrames") else result[k] for k in values}
         return result
 
     @classmethod
-    def parse_settings(cls, text):
+    def parse_settings(cls, text, *, allow_legacy_vtu=False):
         """Parse native configuration text without assigning a run identity."""
         values = {}
         for line in text.splitlines():
@@ -283,10 +293,11 @@ class Config:
                 raise ValueError(f"Duplicate setting: {key}")
             values[key] = value
         name = values.pop("name", None)
+        defaults = DEFAULTS | {"nrVTUFrames": 0} if allow_legacy_vtu else DEFAULTS
         for key in values:
-            if key not in DEFAULTS:
+            if key not in defaults:
                 raise ValueError(f"Unknown setting: {key}")
-            default = DEFAULTS[key]
+            default = defaults[key]
             if type(default) is bool:
                 if values[key].lower() not in ("true", "false", "1", "0"):
                     raise ValueError(f"{key} must be true, false, 1, or 0")
@@ -296,10 +307,10 @@ class Config:
         return name, values
 
     @classmethod
-    def read(cls, path, *, expected_name=None):
+    def read(cls, path, *, expected_name=None, allow_legacy_vtu=False):
         """Read original settings, resolving omissions through campaign metadata."""
-        name, values = cls.parse_settings(Path(path).read_text())
-        result = cls.saved(values)
+        name, values = cls.parse_settings(Path(path).read_text(), allow_legacy_vtu=allow_legacy_vtu)
+        result = cls.saved(values, allow_legacy_vtu=allow_legacy_vtu)
         if name is None:
             raise ValueError("Missing saved configuration name")
         if name != result.folder_name(name.split("[")[0]):

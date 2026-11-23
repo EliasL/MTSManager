@@ -158,8 +158,9 @@ def restore_simulation(output_root, state_dir, row, *, downloaded=False):
                 (row.get("manifest_sha256") and file_digest(manifest) != row["manifest_sha256"])):
             raise ExpectedError(f"The archived run is unavailable or its identity changed: {archived}")
         if not downloaded:
-            from .config import Config
-            if Config.read(archived / "config.conf", expected_name=original.name).config_hash != identity:
+            from .run_records import read_run
+            config, _ = read_run(archived, expected_name=original.name, allow_legacy_vtu=True)
+            if config.config_hash != identity:
                 raise ValueError(f"Archived configuration identity changed: {archived}")
             index = read_json(index_file) if index_file.exists() else {}
             if any(h.startswith(identity[:20]) and (h != identity or name != original.name)

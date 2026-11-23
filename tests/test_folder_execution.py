@@ -20,7 +20,7 @@ from MTS_Management.files import digest, file_digest, read_json, write_json
 from MTS_Management.runner import prepare, launch, execute, attempt_status
 
 ROOT = Path(__file__).resolve().parents[2]
-BINARY = Path(os.environ.get('MTS_TEST_BINARY', ROOT / 'MTS2D/build/MTS2D')).resolve()
+BINARY = Path(os.environ.get('MTS_TEST_BINARY', ROOT / 'MTS2D/build/debug/MTS2D')).resolve()
 
 
 class CampaignIdentityTests(unittest.TestCase):
@@ -162,7 +162,7 @@ class FolderExecutionTests(unittest.TestCase):
             result = serve({"site": asdict(site), "operation": "run",
                             "options": {"settings": config.as_dict(), "skip_completed": True}})
             self.assertTrue(result["skipped"])
-            with self.assertRaisesRegex(ExpectedError, "manually remove the existing folder"):
+            with self.assertRaisesRegex(ExpectedError, "use a separate output root"):
                 prepare(config, **options, label="Second")
             run.rename(root / "removed")
             self.assertEqual(find_fresh_conflict(options["output_root"], config, "Second"), "")

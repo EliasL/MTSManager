@@ -24,6 +24,7 @@ from .provenance import (
     executable_identity, scripts_identity, retain_executable,
     supports_current_configuration, supports_initial_mesh,
 )
+from .run_records import read_run
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 ACTIVE = {"prepared", "queued", "running", "stopping"}
@@ -131,9 +132,9 @@ class RunConflict(ExpectedError):
 
 def run_conflict(folder, statuses=()):
     if any(status["state"] in ACTIVE for status in statuses):
-        return RunConflict(f"A run with these settings is active in {folder}. Stop it before removing its folder.")
+        return RunConflict(f"A run with these settings is active in {folder}. Wait for it to finish or stop the attempt.")
     return RunConflict(f"A run with these settings already exists in {folder}. "
-                       "Choose different settings or manually remove the existing folder before starting again.")
+                       "Choose different settings or use a separate output root.")
 
 
 def find_fresh_conflict(output_root, config, label=None):
@@ -218,12 +219,9 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
                 raise ValueError("Chain predecessor must be the latest submitted Slurm attempt")
         existing = manifest_path.exists()
         if existing:
-            old = read_json(manifest_path)
-            if old["config_hash"] != config.config_hash or old["settings"] != config.as_dict():
+            saved, old = read_run(folder)
+            if saved.config_hash != config.config_hash or saved.as_dict() != config.as_dict():
                 raise ValueError(f"Run manifest/configuration mismatch: {folder}")
-            saved = Config.read(folder / "config.conf", expected_name=folder.name)
-            if saved.config_hash != config.config_hash:
-                raise ValueError("Saved configuration changed")
             previous_statuses = [attempt_status(a) for a in (folder / "attempts").iterdir()]
             if checkpoint is None and not resume_latest:
                 if skip_completed and not any(status["state"] in ACTIVE for status in previous_statuses) and completed_run(folder, saved):
@@ -239,7 +237,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             archived = archived_runs(output_root, {config.config_hash})
             if archived:
                 archived_folder = Path(archived[0]["folder"])
-                saved = Config.read(archived_folder / "config.conf", expected_name=archived_folder.name)
+                saved, _ = read_run(archived_folder)
                 if saved.config_hash != config.config_hash:
                     raise ValueError(f"Archived manifest/configuration mismatch: {archived_folder}")
                 if skip_completed and completed_run(archived_folder, saved):
@@ -363,12 +361,16 @@ def set_status(attempt, state, **fields):
     Journal(request["state_dir"]).append(state, **event_fields(request), **fields)
 
 
+def _launch_fields(attempt, request):
+    return {"attempt": str(attempt), "attempt_id": request["attempt_id"],
+            "output_folder": request["output_folder"],
+            "executable": request["executable"], "build": request["build"]}
+
+
 def launch(attempt, *, mode="foreground", slurm=None, setup=""):
     attempt = Path(attempt).resolve()
     request = read_json(attempt / "request.json")
-    result_fields = {"attempt": str(attempt), "attempt_id": request["attempt_id"],
-                     "output_folder": request["output_folder"],
-                     "executable": request["executable"], "build": request["build"]}
+    result_fields = _launch_fields(attempt, request)
     cmd = python_command("_execute", attempt)
     if request.get("command"):
         script = attempt / "submit.sh"
@@ -457,7 +459,7 @@ def execute(attempt):
         try:
             if read_json(attempt / "status.json")["state"] not in {"prepared", "queued"}:
                 raise RuntimeError("Attempt has already executed or was cancelled")
-            config = Config.read(folder / "config.conf", expected_name=folder.name)
+            config, _ = read_run(folder)
             if config.config_hash != request["config_hash"]:
                 raise ValueError("Configuration changed after submission")
             if executable_identity(request["executable"]) != request["build"]:
@@ -624,21 +626,22 @@ def run_many(attempts, workers=2):
                 return
             request = read_json(Path(attempt) / "request.json")
             if request.get("command"):
-                launch(attempt, mode="foreground")
-                return
+                return launch(attempt, mode="foreground")
             command = python_command("_execute", attempt)
             process = subprocess.Popen(command, cwd=PACKAGE_ROOT,
-                                       start_new_session=True)
+                                       start_new_session=True, stdout=sys.stderr)
             processes.append(process)
         code = process.wait()
         if code:
             raise subprocess.CalledProcessError(code, process.args)
+        return _launch_fields(attempt, request) | {"state": "finished"}
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         try:
             futures = [pool.submit(run, attempt) for attempt in attempts]
             for future in as_completed(futures):
                 future.result()
+            return [future.result() for future in futures]
         except BaseException:
             with guard:
                 cancelled.set()

@@ -26,6 +26,7 @@ from .inventory_cache import export as export_inventory, snapshot as cached_inve
 from .journal import Journal
 from .processes import wait_cancellable
 from .provenance import build, install_source, source_archive, source_files, source_identity, executable_identity
+from .run_records import read_run
 from .runner import PACKAGE_ROOT, RunConflict, attempt_log_tail, find_fresh_conflict, launch, prepare, stop
 
 
@@ -426,7 +427,7 @@ def synchronized_snapshot(sites, state_dir, *, operation="snapshot", **options):
 
 
 def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=None, chain=1,
-           initial_mesh=None, skip_completed=False):
+           initial_mesh=None, skip_completed=False, log=None):
     journal = Journal(state_dir)
     submission = journal.append("submission_requested", site=site.name,
                                 config_hash=config.config_hash, campaign=campaign,
@@ -436,7 +437,7 @@ def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=
         if skip_completed:
             mesh_input["skip_completed"] = True
         result = call(site, "run", settings=config.as_dict(), campaign=campaign,
-                      label=label, checkpoint=checkpoint, chain=chain, **mesh_input)
+                      label=label, checkpoint=checkpoint, chain=chain, log=log, **mesh_input)
     except Exception as error:
         journal.append("submission_error", submission_id=submission["event_id"],
                        site=site.name, config_hash=config.config_hash, campaign=campaign,
@@ -641,7 +642,7 @@ def fetch_many(site, config_hashes, destination, *, kind="macro", completed_only
         target = destination / Path(row["folder"]).name
         if file_digest(target / "manifest.json") != row["manifest_sha256"]:
             raise ValueError(f"Transferred manifest differs from inventory: {target}")
-        config = Config.read(target / "config.conf", expected_name=target.name)
+        config, _ = read_run(target, allow_legacy_vtu=True)
         if config.config_hash != row["config_hash"]:
             raise ValueError(f"Transferred configuration differs from inventory: {target}")
         if mesh_frames is None:

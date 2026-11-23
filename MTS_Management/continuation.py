@@ -157,12 +157,12 @@ def source_run(root, selection, *, verify_inactive=False):
         with locked(folder / ".run.lock", blocking=False):
             if file_digest(manifest) != selection["manifest_sha256"]:
                 raise ExpectedError("The source run changed. Refresh Monitor data and select it again.")
-            record = read_json(manifest)
             config_path = folder / "config.conf"
             if config_path.is_symlink():
                 raise ExpectedError("The source run configuration must be a physical file.")
-            config = Config.read(config_path, expected_name=folder.name)
-            if record["config_hash"] != selection["config_hash"] or record["settings"] != config.as_dict():
+            from .run_records import read_run
+            config, _ = read_run(folder)
+            if config.config_hash != selection["config_hash"]:
                 raise ExpectedError("The source run has an inconsistent configuration identity.")
             if verify_inactive:
                 check_inactive(folder)

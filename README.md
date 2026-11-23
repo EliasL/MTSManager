@@ -28,7 +28,8 @@ mts run examples/smoke.conf --campaign Smoke
 mts status overview --site local
 ```
 
-The build requires CMake, a C++17 compiler, OpenMP and zlib. The simulator source
+The default build requires CMake 3.23 or newer, a C++17 compiler, OpenMP,
+OpenSSL, zlib, BLAS and LAPACK. The simulator source
 must use committed build inputs on `main` or a pinned commit verified to belong
 to `origin/main` (as in a Git submodule). The supplied smoke
 configuration runs a small system to check the installation.
@@ -42,7 +43,8 @@ Paths in a local profile are relative to the site file. Recreate CMake
 build directories and editable installations if you move the repositories.
 
 Use `mts --help` or `mts COMMAND --help` for command options.
-`python -m MTS_Management` is equivalent to `mts`.
+`python -m MTS_Management` is equivalent to `mts`. See the
+[automation API](API.md) for Python entry points and JSON receipts.
 
 ## Configurations and parameter sweeps
 
@@ -314,15 +316,12 @@ python -m unittest discover -s tests -v
 ```
 
 The suite covers run identity, execution history, process control, scheduler
-continuation and data integrity. Small real-simulator checks run when the isolated
-`../MTS2D/build/release/MTS2D` executable is available. Scheduler tests do not
-submit cluster jobs.
+continuation and data integrity. Simulator integration checks use
+`../MTS2D/build/debug/MTS2D` when present, or the executable selected by
+`MTS_TEST_BINARY`. To test against the managed Release executable:
 
+```sh
+MTS_TEST_BINARY=../MTS2D/build/release/MTS2D python -m unittest discover -s tests -v
+```
 
-Campaign directories contain `simulations.json` (original labelled settings),
-`resources.json` (submission resources) and editable `metadata.json` (missing
-settings and binary references). Supplements fill only absent keys. They do not
-change the original configuration or its hash. Update MTS on servers transfers
-manager code, campaign files and a verified MTS2D source snapshot; compilation
-is a separate operation. Scientific output and retained binaries are preserved.
-Each attempt saves its exact command, environment and script under `attempts/`.
+Scheduler tests use fixtures.

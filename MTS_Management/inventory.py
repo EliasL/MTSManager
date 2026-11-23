@@ -8,11 +8,11 @@ from pathlib import Path
 import shutil
 import time
 
-from .config import Config
 from .data import last_macro_row
 
 from .files import file_digest, locked, now, read_json, write_json
 from .inventory_cache import invalidate, publish, records
+from .run_records import read_run
 from .runner import process_token, attempt_status
 
 
@@ -83,10 +83,7 @@ def rebuild_index(output_root, *, keep_missing=False):
         for folder in root.iterdir():
             if not folder.is_dir() or not (folder / "manifest.json").exists():
                 continue
-            config = Config.read(folder / "config.conf", expected_name=folder.name)
-            manifest = read_json(folder / "manifest.json")
-            if manifest["config_hash"] != config.config_hash:
-                raise ValueError(f"Manifest/config mismatch: {folder}")
+            config, _ = read_run(folder, allow_legacy_vtu=True)
             if config.config_hash in index:
                 raise ValueError(f"Duplicate configuration directories: {folder}")
             index[config.config_hash] = folder.name
@@ -184,7 +181,7 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
                 and row.get("settings_metadata") == config_metadata_stamp()):
             result.append(row)
             continue
-        config = Config.read(folder / "config.conf", expected_name=folder.name)
+        config, manifest = read_run(folder, allow_legacy_vtu=True)
         if config.config_hash != h:
             raise ValueError(f"Index/config mismatch: {folder}")
         requests = {attempt: read_json(attempt / "request.json") for attempt in (folder / "attempts").iterdir()}
@@ -193,7 +190,7 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
         manifest_path = folder / "manifest.json"
         run_date = next((statuses[a]["started_at"] for a in attempts if statuses[a].get("started_at")), None)
         if run_date is None:
-            run_date = read_json(manifest_path).get("created_at")
+            run_date = manifest.get("created_at")
         active = [a for a in attempts if statuses[a]["state"] in {"running", "stopping"}]
         queued = [a for a in attempts if statuses[a]["state"] in {"prepared", "queued"}]
         attempt = (active[-1] if active else queued[0] if queued else attempts[-1]) if attempts else None

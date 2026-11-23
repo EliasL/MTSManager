@@ -7,18 +7,22 @@ from pathlib import Path
 from functools import lru_cache
 
 
-def campaign_entries(path):
-    data = read_json(path)
-    if data.keys() != {"name", "runs"} or not data["runs"]:
-        raise ValueError("Campaign requires name and nonempty runs")
+def campaign_entries(path, *, allow_legacy_vtu=False):
     metadata = Path(path).with_name("metadata.json")
     supplement = read_json(metadata).get("missing_settings", {}) if metadata.exists() else {}
+    return validate_campaign(read_json(path), supplement, allow_legacy_vtu=allow_legacy_vtu)
+
+
+def validate_campaign(data, supplement=None, *, allow_legacy_vtu=False):
+    """Validate a campaign definition and return its name and labelled configurations."""
+    if data.keys() != {"name", "runs"} or not data["runs"]:
+        raise ValueError("Campaign requires name and nonempty runs")
     result = []
     seen = set()
     for entry in data["runs"]:
         if entry.keys() != {"label", "settings"}:
             raise ValueError("Campaign runs require label and complete settings")
-        config = Config.saved(entry["settings"], supplement)
+        config = Config.saved(entry["settings"], supplement, allow_legacy_vtu=allow_legacy_vtu)
         if entry["settings"].keys() != config.as_dict().keys():
             raise ValueError("Campaign settings must be complete")
         config.folder_name(entry["label"])

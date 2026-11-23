@@ -12,12 +12,14 @@ Do not test trivial helpers, routine forwarding or every validation branch merel
 to increase coverage. Small changes usually need no new test. Remove redundant
 existing tests; add focused regressions when real bugs reveal a useful gap.
 
-This is a standalone project for MTS2D `main`. Do not import legacy
-SimulationScripts, accept old configuration names, or add historical reader
-fallbacks. Raise errors for unexpected data. Prefer a small shared implementation
-for local and remote operations.
+This project manages MTS2D `main`. Keep the [automation API](API.md) current.
+Use `submission.py` for shared CLI and GUI submission, and `run_records.py`
+to verify native run folders. Keep current execution validation strict. Preserve
+original run identities when interpreting recorded settings for analysis.
+Keep interpretation of scientific records explicit and scoped to the readers
+that need it. Keep dependencies independent of SimulationScripts.
 
-- Keep every supported simulator setting explicit in saved configurations.
+- Keep active simulator settings explicit in new saved configurations.
   Review `MTS_Management/defaults.json` against the C++ parser when its schema changes.
 - Configuration identity excludes the generated name; executable and checkpoint
   identities are recorded separately. Never silently overwrite/resume another run.
@@ -31,5 +33,6 @@ for local and remote operations.
   Use total `T` for physical fixed-coordinate stress, preserving its rotation.
 - Energy functions return densities. Current macro `avg_energy` is mean energy
   per triangle; account for reference area when comparing the two.
-- Use `python -m unittest discover -s tests -v`; real-simulator tests run when
-  this project's isolated build exists. Do not submit production jobs for tests.
+- Use `python -m unittest discover -s tests -v` from this checkout. Use
+  `MTS_TEST_BINARY` to select a real simulator for integration tests.
+  Use isolated local sites or scheduler fixtures for verification.

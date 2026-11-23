@@ -28,6 +28,17 @@ def mesh_checksum(text):
     return sha256(mesh_bytes(text)).hexdigest()
 
 
+def read_mesh(path):
+    with Path(path).open("rb") as stream:
+        data = stream.read(MAX_MESH_BYTES + 1)
+    if len(data) > MAX_MESH_BYTES:
+        raise ExpectedError("The initial VTU must be at most 16 MiB.")
+    try:
+        return data.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ExpectedError("Supply an ASCII VTU file for the initial mesh.") from error
+
+
 def verify_mesh(folder, config):
     checksum = config["initialMeshSha256"]
     if not checksum:
