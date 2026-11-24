@@ -50,6 +50,7 @@ class Site:
     environment: dict = field(default_factory=dict)
     slurm_cpus_per_thread: int = 1
     slurm: dict = field(default_factory=dict)
+    require_output_root: bool = False
 
     def __post_init__(self):
         if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", self.management_module):
@@ -83,7 +84,10 @@ def load_sites(path, *, include_disabled=False):
     deployments = read_json(deployments_file) if deployments_file.exists() else {}
     connection_file = path.parent / ".state/ssh-connections.json"
     connections = read_json(connection_file) if connection_file.exists() else {}
-    for name, settings in data["sites"].items():
+    from .local_output import local_output_settings
+    overrides = local_output_settings(path)["sites"]
+    for name, settings in (data["sites"] | overrides).items():
+        settings = data["sites"].get(name, {}) | settings
         site = Site(name=name, **settings)
         if not site.ssh:
             site.directory = str((path.parent / site.directory).resolve())
@@ -115,6 +119,11 @@ def paths(site):
     return result
 
 
+def require_available_output(site, location):
+    if site.require_output_root and not Path(location["output_root"]).is_dir():
+        raise ExpectedError(f"Output for {site.name} is unavailable. Mount its drive or select another local site.")
+
+
 def scheduler_jobs():
     result = subprocess.run(["squeue", "--noheader", "--user", getpass.getuser(),
                              "--format=%i|%T|%j|%M|%R"],
@@ -133,6 +142,8 @@ def serve(payload, *, cancel=None, log=None):
     p = paths(site)
     op = payload["operation"]
     options = payload.get("options", {})
+    if op in {"run", "resume"}:
+        require_available_output(site, p)
     if op == "info":
         import sys
         from .provenance import scripts_identity
@@ -282,6 +293,8 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, *
         raise ValueError(f"Connection {site.ssh or site.name} is disabled")
     settings = asdict(site)
     settings.pop("disabled")
+    if site.ssh or not site.require_output_root:
+        settings.pop("require_output_root")
     module = settings.pop("management_module")  # Client transport setting, not remote job data.
     manager_directory = settings.pop("manager_directory")
     if manager_directory:
@@ -520,6 +533,7 @@ def deploy(site, *, include_source=False, local_source=None):
     # Native CLI use on the cluster must work too, without the initiating client.
     native = asdict(site)
     native.pop("name")
+    native.pop("require_output_root")
     native["ssh"] = ""
     native["directory"] = directory
     slurm = native.pop("slurm")

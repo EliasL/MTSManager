@@ -56,6 +56,18 @@ error and a revision identifying the failed attempt. Pass that revision as
 `known_failure` to request a retry. `minimum_scan_start` optionally limits
 collection to snapshots whose scan began at or after a Unix timestamp.
 
+## Local output locations
+
+Use `MTS_Management.local_output.plan_local_output(site_file, site, destination,
+move=True)` to review a move. It returns the resolved source and destination,
+active attempts with their checkpoint loads, and any blockers. Pass the reviewed
+`source` and the approved `attempt` paths as `approved_attempts` to
+`change_local_output(site_file, site, destination, move=True, ...)`. The manager
+checks these identities again before signalling any process. The result contains
+the effective `output_root`, newly submitted resume jobs in `resumed`, and any
+per-run or move `errors`. Use `move=False, new_site=NAME` to create a separate
+local output site. Reload the site profiles after either change.
+
 ## Submit explicitly
 
 After reviewing the configuration and site, pass a validated `Config` to

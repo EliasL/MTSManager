@@ -28,6 +28,7 @@ from .run_records import read_run_for_execution
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 ACTIVE = {"prepared", "queued", "running", "stopping"}
+MOVED_OUTPUT = ".mts-output-moved"
 _PRINT_LOCK = threading.Lock()
 
 
@@ -152,6 +153,20 @@ def find_fresh_conflict(output_root, config, label=None):
     return ""
 
 
+def validate_execution_build(config, build):
+    if config["initialMeshSha256"] and not supports_initial_mesh(build):
+        raise ExpectedError("Build MTS2D at the execution site to use a custom initial mesh.")
+    if not supports_current_configuration(build):
+        raise ExpectedError("Build MTS2D at the execution site to use the current configuration.")
+    if config["energyFunction"] == "conti2Phase" and not build.get("conti_2_phase"):
+        raise ExpectedError("Rebuild MTS2D at the execution site to use Conti2Phase.")
+    if (config["reconnectionMethod"] == "delaunay" and
+            (config["boundary"] not in {"periodic", "periodicAnchored"} or
+             config["initialMeshSha256"] or min(config["rows"], config["cols"]) < 3) and
+            not build.get("constrained_delaunay")):
+        raise ExpectedError("Rebuild MTS2D at the execution site to use Delaunay with these mesh options.")
+
+
 def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", label=None,
             checkpoint=None, site="local", environment=None, after=None, continuation=None,
             resume_selection=None, initial_mesh=None, skip_completed=False, log=None):
@@ -184,6 +199,8 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
     if checkpoint and not checkpoint.is_file():
         raise FileNotFoundError(checkpoint)
     with locked(output_root / ".prepare.lock"):
+        if (output_root / MOVED_OUTPUT).is_file():
+            raise ExpectedError("This output directory moved. Reload the site settings before submitting.")
         index_path = output_root / ".run-index.json"
         index = read_json(index_path) if index_path.exists() else {}
         folder = output_root / config.folder_name(label)
@@ -203,8 +220,8 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             with source_run(output_root, resume_selection, verify_inactive=True) as (_, saved):
                 attempts = (folder / "attempts").iterdir()
                 latest = max(attempts, key=lambda a: read_json(a / "request.json")["created_at"], default=None)
-                if latest is None or attempt_status(latest)["state"] != "failed":
-                    raise ExpectedError("Select a run whose latest attempt failed.")
+                if latest is None or attempt_status(latest)["state"] not in {"failed", "stopped"}:
+                    raise ExpectedError("Select a run whose latest attempt failed or stopped.")
                 if saved.as_dict() != config.as_dict():
                     raise ExpectedError("The saved configuration changed. Refresh Monitor data.")
                 checkpoint_files(folder)
@@ -253,15 +270,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             raise ValueError("Load further requires a current folder-based MTS2D build")
         if resume_selection is not None and build.get("execution_interface") != "folder-v1":
             raise ExpectedError("Resume requires a retained build with folder-based checkpoint loading.")
-        if config["initialMeshSha256"] and not supports_initial_mesh(build):
-            raise ExpectedError("Build MTS2D at the execution site to use a custom initial mesh.")
-        if not supports_current_configuration(build):
-            raise ExpectedError("Build MTS2D at the execution site to use the current configuration.")
-        if (config["reconnectionMethod"] == "delaunay" and
-                (config["boundary"] not in {"periodic", "periodicAnchored"} or
-                 config["initialMeshSha256"] or min(config["rows"], config["cols"]) < 3) and
-                not build.get("constrained_delaunay")):
-            raise ExpectedError("Rebuild MTS2D at the execution site to use Delaunay with these mesh options.")
+        validate_execution_build(config, build)
         from .campaign import record_executable
         record_executable(campaign, site, executable)
         identity = {"config_hash": config.config_hash, "settings": config.as_dict(),

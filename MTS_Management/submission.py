@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .campaign import install_campaign_files, validate_campaign
-from .cluster import call, paths, submit
+from .cluster import call, paths, require_available_output, submit
 from .config import Config
 from .errors import ExpectedError
 from .files import read_json
@@ -28,6 +28,7 @@ def _check_chain(site, chain):
 
 def _prepare(site, config, *, log=None, **options):
     location = paths(site)
+    require_available_output(site, location)
     return prepare(config, executable=location["executable"], output_root=location["output_root"],
                    state_dir=location["state_dir"], site=site.name, environment=site.environment,
                    log=log, **options)

@@ -217,6 +217,8 @@ def _build(source, build_dir, *, jobs=2, native_arch=False, archive_dir=None):
                          "cmake_cache_sha256": file_digest(build_dir / "CMakeCache.txt")}
     if subprocess.run([executable, "--supports-constrained-delaunay"], capture_output=True).returncode == 0:
         record["constrained_delaunay"] = True
+    if subprocess.run([executable, "--supports-conti-2-phase"], capture_output=True).returncode == 0:
+        record["conti_2_phase"] = True
     write_json(build_dir / "build-manifest.json", record)
     retain_executable(executable, archive_dir)
     return record

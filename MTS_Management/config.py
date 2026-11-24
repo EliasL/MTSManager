@@ -86,7 +86,7 @@ class Config:
             "preconditioner": {"none", "exactTangent", "diagonal"},
             "tangentBackend": {"cholmod", "eigen"},
             "preconditionerUpdate": {"adaptive", "every", "frozen"},
-            "energyFunction": {"contiSquare", "contiTriangular"},
+            "energyFunction": {"contiSquare", "contiTriangular", "conti2Phase"},
             "constitutiveReference": {"areaNormalizedTriangular"},
             "meshDiagonal": {"major", "minor"},
         }

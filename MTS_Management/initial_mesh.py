@@ -71,6 +71,8 @@ def preview(executable, config):
             error = process.stderr.strip()
             if "unrecognized option" in error or "illegal option" in error:
                 raise ExpectedError("Rebuild MTS2D on the preview site to enable the mesh preview.")
+            if config["energyFunction"] == "conti2Phase" and "Invalid energy function: conti2Phase" in error:
+                raise ExpectedError("Rebuild MTS2D on the preview site to use Conti2Phase.")
             if process.returncode < 0:
                 raise RuntimeError(f"MTS2D preview exited with signal {-process.returncode}: {error}")
             raise ExpectedError(error or "MTS2D could not generate the mesh preview.")
