@@ -73,6 +73,10 @@ def preview(executable, config):
                 raise ExpectedError("Rebuild MTS2D on the preview site to enable the mesh preview.")
             if config["energyFunction"] == "conti2Phase" and "Invalid energy function: conti2Phase" in error:
                 raise ExpectedError("Rebuild MTS2D on the preview site to use Conti2Phase.")
+            if config["energyFunction"] == "triangularCubic" and "Invalid energy function: triangularCubic" in error:
+                raise ExpectedError("Rebuild MTS2D on the preview site to use triangularCubic.")
+            if "Unknown configuration key: conti_" in error:
+                raise ExpectedError("Rebuild MTS2D on the preview site to use Conti material overrides.")
             if process.returncode < 0:
                 raise RuntimeError(f"MTS2D preview exited with signal {-process.returncode}: {error}")
             raise ExpectedError(error or "MTS2D could not generate the mesh preview.")

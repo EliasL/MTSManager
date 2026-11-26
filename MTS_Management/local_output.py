@@ -15,7 +15,7 @@ from .archive import archive_root, check_inactive
 from .continuation import checkpoint_files, latest_checkpoint
 from .data import last_macro_row
 from .errors import ExpectedError
-from .files import locked, read_json, write_json
+from .files import attempt_directories, locked, read_json, write_json
 from .provenance import executable_identity
 from .run_records import read_run_for_execution
 from .runner import ACTIVE, MOVED_OUTPUT, attempt_status, completed_run, stop, validate_execution_build
@@ -101,7 +101,7 @@ def _active_runs(root):
             continue
         attempts = folder / "attempts"
         running = []
-        for attempt in attempts.iterdir() if attempts.is_dir() else ():
+        for attempt in attempt_directories(attempts) if attempts.is_dir() else ():
             status = attempt_status(attempt)
             if status["state"] in ACTIVE or status.get("process_alive"):
                 running.append((attempt, status))

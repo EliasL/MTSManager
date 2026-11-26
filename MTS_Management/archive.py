@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from .errors import ExpectedError
-from .files import file_digest, locked, read_json, write_json
+from .files import attempt_directories, file_digest, locked, read_json, write_json
 from .inventory_cache import invalidate
 from .journal import Journal
 from .runner import attempt_status, process_token, scheduler_state, SCHEDULER_TERMINAL
@@ -70,7 +70,7 @@ def rename_folder(source, destination):
 
 def check_inactive(folder):
     scheduler_ids = set()
-    for attempt in (folder / "attempts").iterdir():
+    for attempt in attempt_directories(folder / "attempts"):
         status = attempt_status(attempt)
         if status.get("scheduler_id"):
             scheduler_ids.add(status["scheduler_id"])

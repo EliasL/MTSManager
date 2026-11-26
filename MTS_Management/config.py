@@ -10,6 +10,8 @@ from types import MappingProxyType
 from .files import digest
 
 DEFAULTS = json.loads(Path(__file__).with_name("defaults.json").read_text())
+TRIANGULAR_REFERENCE_POTENTIALS = {"contiTriangular", "triangularCubic"}
+CONTI_PARAMETERS = {"conti_beta", "conti_kappa"}
 SCHEMA_REVISION = "23e61580faa0c3a4d6c0ca7d730dfbe00d1da95f"
 RECTANGLE_EDGES = ("top", "bottom", "left", "right")
 RECTANGLE_SETTINGS = {"drivenEdge", *RECTANGLE_EDGES}
@@ -86,7 +88,7 @@ class Config:
             "preconditioner": {"none", "exactTangent", "diagonal"},
             "tangentBackend": {"cholmod", "eigen"},
             "preconditionerUpdate": {"adaptive", "every", "frozen"},
-            "energyFunction": {"contiSquare", "contiTriangular", "conti2Phase"},
+            "energyFunction": {"contiSquare", "conti2Phase"} | TRIANGULAR_REFERENCE_POTENTIALS,
             "constitutiveReference": {"areaNormalizedTriangular"},
             "meshDiagonal": {"major", "minor"},
         }
@@ -150,6 +152,12 @@ class Config:
                 v["loading"] != "relaxation" or v["deformation"] != "simpleShear" or
                 v["energyFunction"] != "contiSquare"):
             raise ValueError("Plastic/elastic targets require relaxation, simpleShear and contiSquare")
+        if (v["stopAfterPlasticSteps"] or v["stopAfterElasticSteps"]) and v["conti_beta"] not in (0, -0.25):
+            raise ValueError("Plastic/elastic targets require the contiSquare preset beta of -0.25")
+        if v["energyFunction"] == "triangularCubic" and v["conti_beta"] != 0:
+            raise ValueError("Set conti_beta to zero for triangularCubic.")
+        if v["conti_kappa"] < 0:
+            raise ValueError("conti_kappa must be nonnegative")
         if v["preconditionerDisplacementThreshold"] <= 0:
             raise ValueError("preconditionerDisplacementThreshold must be positive")
         if v["forceReRun"]:
@@ -179,7 +187,7 @@ class Config:
             if v[edge] not in {"free", "fixed_x", "fixed_y", "fixed"}:
                 raise ValueError(f"{edge} must be free, fixed_x, fixed_y, or fixed")
         vertical = driven in {"top", "bottom"}
-        triangular = v["energyFunction"] == "contiTriangular"
+        triangular = v["energyFunction"] in TRIANGULAR_REFERENCE_POTENTIALS
         if triangular and not vertical:
             raise ValueError("Choose the top or bottom driven edge for a triangular sample")
         adjacent = ("left", "right") if vertical else ("top", "bottom")
@@ -207,7 +215,7 @@ class Config:
                 v["segmentLoad"] != 0 or v["repeat"]):
             raise ValueError("Nanoindentation requires bottom fixation, relaxation, at least two rows and "
                              "columns, and an unsegmented loading path")
-        spacing = math.sqrt(3) / 2 if v["energyFunction"] == "contiTriangular" else 1
+        spacing = math.sqrt(3) / 2 if v["energyFunction"] in TRIANGULAR_REFERENCE_POTENTIALS else 1
         if (v["indenterRadius"] <= 0 or v["loadIncrement"] <= 0 or v["startLoad"] < 0 or
                 v["startLoad"] + v["totalLoad"] >= (v["rows"] - 1) * spacing):
             raise ValueError("Nanoindentation requires a positive radius and increment, a nonnegative "
@@ -227,14 +235,14 @@ class Config:
 
     @staticmethod
     def inactive_settings(values):
-        excluded = set()
+        excluded = {key for key in CONTI_PARAMETERS if not values.get(key)}
         if not values.get("initialMeshSha256"):
             excluded.add("initialMeshSha256")
         if values.get("boundary") != "rectangle":
             excluded.update(RECTANGLE_SETTINGS)
         if values.get("deformation") != "nanoindentation":
             excluded.update(INDENTATION_SETTINGS)
-        if values.get("energyFunction") != "contiTriangular":
+        if values.get("energyFunction") not in TRIANGULAR_REFERENCE_POTENTIALS:
             excluded.add("constitutiveReference")
         return excluded
 

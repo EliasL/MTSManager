@@ -10,7 +10,7 @@ import time
 
 from .data import duration_seconds, last_macro_row
 
-from .files import file_digest, locked, now, read_json, write_json
+from .files import attempt_directories, file_digest, locked, now, read_json, write_json
 from .inventory_cache import invalidate, publish, records
 from .run_records import read_run
 from .runner import process_token, attempt_status
@@ -202,7 +202,7 @@ def _inventory(root, *, config_hash, config_hashes, refresh_sizes, hard_refresh,
         config, manifest = read_run(folder)
         if config.config_hash != h:
             raise ValueError(f"Index/config mismatch: {folder}")
-        requests = {attempt: read_json(attempt / "request.json") for attempt in (folder / "attempts").iterdir()}
+        requests = {attempt: read_json(attempt / "request.json") for attempt in attempt_directories(folder / "attempts")}
         attempts = sorted(requests, key=lambda p: requests[p]["created_at"])
         statuses = {a: attempt_status(a) for a in attempts}
         manifest_path = folder / "manifest.json"

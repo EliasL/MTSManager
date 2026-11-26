@@ -150,8 +150,9 @@ unrelated cached records and leaves the full-inventory timestamp unchanged. An
 empty list selects no runs. The GUI uses this operation for campaign refreshes.
 If the run index is absent, the manager constructs it before reading the selection.
 
-The desktop application's Update MTS on servers action transfers the manager,
-campaign directories and verified simulator source. The shared package identity
+In the desktop application's **SSH connections** panel, **Deploy** and
+**Update MTS on servers** transfer the manager, campaign directories and
+verified simulator source. The shared package identity
 is checked before recording profile locations in `.state/manager-deployments.json`.
 Source compilation remains separate. Retained binaries and scientific output
 are preserved.

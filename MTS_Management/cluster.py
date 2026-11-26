@@ -149,6 +149,18 @@ def serve(payload, *, cancel=None, log=None):
         from .provenance import scripts_identity
         return {"python": sys.version, "executable": sys.executable,
                 "scripts": scripts_identity(), "paths": p}
+    if op == "campaign_preflight":
+        from .provenance import executable_identity
+        try:
+            require_available_output(site, p)
+        except ExpectedError as error:
+            return {"error": str(error)}
+        retained = (Path(p["executable"]).parent / ".retained").exists()
+        try:
+            return {"build": executable_identity(p["executable"]), "retained": retained}
+        except (OSError, ValueError, KeyError):
+            return {"error": "Build MTS2D at the execution site. Its executable or build manifest is missing or invalid.",
+                    "retained": retained}
     if op == "reindex":
         return rebuild_index(p["output_root"])
     if op == "inventory":
@@ -156,13 +168,16 @@ def serve(payload, *, cancel=None, log=None):
     if op == "inventory_refresh":
         return request_refresh(p["output_root"], **options)
     if op == "mesh_snapshots":
-        from .data import mesh_snapshots
+        from .data import mesh_snapshots, vtu_fields
         folder = Path(options["folder"])
         if (folder.parent != Path(p["output_root"]) or folder.is_symlink() or
                 not (folder / "manifest.json").is_file() or
                 file_digest(folder / "manifest.json") != options["manifest_sha256"]):
             return {"error": "The remote simulation changed. Select it again in Monitor data."}
-        return {"frames": mesh_snapshots(folder)}
+        frames = mesh_snapshots(folder)
+        if options.get("fields"):
+            return {"fields": vtu_fields(folder / "data" / frames[-1]["name"]) if frames else {}}
+        return {"frames": frames}
     if op == "plot_seed_group":
         from .data import plot_seed_group
         from .errors import ExpectedError
@@ -217,6 +232,11 @@ def serve(payload, *, cancel=None, log=None):
                 "journal": Journal(p["state_dir"]).since(options.get("journal_offset", 0))}
     if op == "install_source":
         return install_source(p["source"], options["staging"], options["expected"])
+    if op in {"campaign_batch_start", "campaign_batch_status"}:
+        from .campaign_batch import batch_status, start_batch
+        if op == "campaign_batch_start":
+            return start_batch(site, **options)
+        return batch_status(site, **options)
     if op == "build":
         return build(p["source"], Path(p["executable"]).parent,
                      native_arch=site.native_arch, archive_dir=Path(site.directory).resolve() / "executables", **options)
@@ -273,6 +293,10 @@ def serve(payload, *, cancel=None, log=None):
                 if i or not options.get("skip_completed"):
                     raise
                 return {"conflict": str(error), "label": options.get("label"), "config_hash": config.config_hash}
+            except ExpectedError as error:
+                if i or not options.get("skip_completed"):
+                    raise
+                return {"rejected": str(error)}
             if attempt is None:
                 return {"skipped": True, "label": options.get("label"), "config_hash": config.config_hash}
             jobs.append(launch(attempt, mode=mode, slurm=slurm, setup=site.setup))
@@ -335,7 +359,7 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, *
         request.write(canonical(payload))
         request.seek(0)
         progress = (files.enter_context(tempfile.TemporaryFile())
-                    if log and operation == "run" and options.get("continuation") else None)
+                    if log and (operation == "build" or (operation == "run" and options.get("continuation"))) else None)
         offset = 0
         pending = b""
 
@@ -385,7 +409,7 @@ def call(site, operation, *, timeout=30, log=None, cancel=None, _program=None, *
                     error.output, error.stderr = stdout, stderr
                 raise
             stderr = collect_stderr(stderr)
-            if log and progress is None and stderr.strip():
+            if log and progress is None and stderr.strip() and process.returncode != EXPECTED_ERROR_EXIT:
                 log(stderr.rstrip())
             if process.returncode:
                 if process.returncode == EXPECTED_ERROR_EXIT:
@@ -443,7 +467,7 @@ def synchronized_snapshot(sites, state_dir, *, operation="snapshot", **options):
 
 
 def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=None, chain=1,
-           initial_mesh=None, skip_completed=False, log=None):
+           initial_mesh=None, skip_completed=False, log=None, on_site=False):
     journal = Journal(state_dir)
     submission = journal.append("submission_requested", site=site.name,
                                 config_hash=config.config_hash, campaign=campaign,
@@ -452,8 +476,12 @@ def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=
         mesh_input = {"initial_mesh": initial_mesh} if initial_mesh is not None else {}
         if skip_completed:
             mesh_input["skip_completed"] = True
-        result = call(site, "run", settings=config.as_dict(), campaign=campaign,
-                      label=label, checkpoint=checkpoint, chain=chain, log=log, **mesh_input)
+        options = dict(settings=config.as_dict(), campaign=campaign, label=label,
+                       checkpoint=checkpoint, chain=chain, **mesh_input)
+        if on_site:
+            result = serve({"site": asdict(site), "operation": "run", "options": options}, log=log)
+        else:
+            result = call(site, "run", log=log, **options)
     except Exception as error:
         journal.append("submission_error", submission_id=submission["event_id"],
                        site=site.name, config_hash=config.config_hash, campaign=campaign,
@@ -461,17 +489,22 @@ def submit(site, config, *, state_dir, campaign="AdHoc", label=None, checkpoint=
         if skip_completed and "unexpected keyword argument 'skip_completed'" in str(error):
             raise ExpectedError(f"Update MTSManager on {site.name} to skip completed campaign members.") from error
         raise
+    if "rejected" in result:
+        journal.append("submission_rejected", submission_id=submission["event_id"], site=site.name,
+                       campaign=campaign, error=result["rejected"])
+        raise ExpectedError(result["rejected"])
     if result.get("skipped") or result.get("conflict"):
         journal.append("submission_skipped" if result.get("skipped") else "submission_conflict",
                        submission_id=submission["event_id"], site=site.name, campaign=campaign, **result)
         return result
     journal.append("submission_accepted", submission_id=submission["event_id"],
                    site=site.name, config_hash=config.config_hash, campaign=campaign, **result)
-    for job in result.get("jobs", [result]):
-        if job.get("executable"):
-            archive_binary(site, job, campaign, state_dir)
-    # Execution events arriving later are imported by sync-log (and status jobs).
-    sync_journals([site], state_dir)
+    if not on_site:
+        for job in result.get("jobs", [result]):
+            if job.get("executable"):
+                archive_binary(site, job, campaign, state_dir)
+        # Execution events arriving later are imported by sync-log (and status jobs).
+        sync_journals([site], state_dir)
     return result
 
 
@@ -510,12 +543,14 @@ def deploy(site, *, include_source=False, local_source=None):
         if not directory.startswith("~/"):
             raise ValueError("Remote directory must be absolute or start with ~/")
         # Resolve HOME using SSH, not the local user's home directory.
-        home = subprocess.check_output(["ssh", "-T", site.ssh, "printenv HOME"], text=True).strip()
+        home = subprocess.check_output(["ssh", "-T", site.ssh, "printenv HOME"],
+                                       stderr=subprocess.PIPE, text=True).strip()
         directory = str(Path(home) / directory[2:])
     if include_source:
         source_path = site.source
         if source_path.startswith("~/"):
-            home = subprocess.check_output(["ssh", "-T", site.ssh, "printenv HOME"], text=True).strip()
+            home = subprocess.check_output(["ssh", "-T", site.ssh, "printenv HOME"],
+                                           stderr=subprocess.PIPE, text=True).strip()
             source_path = str(Path(home) / source_path[2:])
         remote_source = Path(source_path)
         if not remote_source.is_absolute():
@@ -524,12 +559,14 @@ def deploy(site, *, include_source=False, local_source=None):
         # Resolve '..' before protecting the shared legacy source directory.
         if str(remote_source).rstrip("/").endswith("/simulation/MTS2D"):
             raise ValueError("Use a dedicated current-source snapshot, not ~/simulation/MTS2D")
-    subprocess.run(["ssh", "-T", site.ssh, "mkdir -p -- " + shlex.quote(directory)], check=True)
+    subprocess.run(["ssh", "-T", site.ssh, "mkdir -p -- " + shlex.quote(directory)],
+                   check=True, capture_output=True, text=True)
     exclude = [".git", ".venv", "__pycache__", "*.egg-info", ".state", "output", "build*", "executables", "sites.toml"]
     args = ["rsync", "-a", "-e", "ssh -T"]
     for item in exclude:
         args += ["--exclude", item]
-    subprocess.run(args + [str(PACKAGE_ROOT) + "/", f"{site.ssh}:{shlex.quote(directory)}/"], check=True)
+    subprocess.run(args + [str(PACKAGE_ROOT) + "/", f"{site.ssh}:{shlex.quote(directory)}/"],
+                   check=True, capture_output=True, text=True)
     # Native CLI use on the cluster must work too, without the initiating client.
     native = asdict(site)
     native.pop("name")
@@ -547,29 +584,45 @@ def deploy(site, *, include_source=False, local_source=None):
         config = Path(temporary) / "sites.toml"
         config.write_text(text)
         subprocess.run(["rsync", "-a", "--ignore-existing", "-e", "ssh -T", str(config),
-                        f"{site.ssh}:{shlex.quote(directory)}/"], check=True)
+                        f"{site.ssh}:{shlex.quote(directory)}/"], check=True, capture_output=True, text=True)
     if include_source:
         staging = remote_source.parent / (".mts-source-upload-" + secrets.token_hex(8))
         target = f"{site.ssh}:{shlex.quote(str(staging))}/"
-        # Use a fixed relative basis name so remote source paths need quoting only in SSH.
-        command = ("umask 077; mkdir -p -- " + shlex.quote(str(staging)) +
-                   " && ln -s -- " + shlex.quote(str(remote_source)) + " " +
-                   shlex.quote(str(staging / ".basis")))
-        subprocess.run(["ssh", "-T", site.ssh, command], check=True)
         local_source = Path(local_source).resolve()
         files = source_files(local_source)
-        with tempfile.TemporaryDirectory() as temporary:
-            records = Path(temporary)
-            listing = records / "files"
-            listing.write_bytes(b"".join(os.fsencode(name) + b"\0" for name in files))
-            subprocess.run(["rsync", "-aLc0", "-e", "ssh -T", "--copy-dest=.basis",
-                            f"--files-from={listing}", str(local_source) + "/", target], check=True)
-            if source_identity(local_source) != source_record:
-                raise RuntimeError("Source changed during deployment")
-            write_json(records / "SOURCE.json", source_record)
-            write_json(records / "SOURCE_FILES.json", files)
-            subprocess.run(["rsync", "-a", "-e", "ssh -T", str(records / "SOURCE.json"),
-                            str(records / "SOURCE_FILES.json"), target], check=True)
+        ssh = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
+        remote = [*ssh, site.ssh]
+        quoted_staging = shlex.quote(str(staging))
+        subprocess.run([*remote, "umask 077; mkdir -p -- " + shlex.quote(str(staging.parent)) +
+                        " && mkdir -- " + quoted_staging], check=True, capture_output=True, text=True, timeout=30)
+        try:
+            # The fixed relative basis lets rsync reuse unchanged files locally.
+            command = "ln -s -- " + shlex.quote(str(remote_source)) + " " + shlex.quote(str(staging / ".basis"))
+            subprocess.run([*remote, command], check=True, capture_output=True, text=True, timeout=30)
+            with tempfile.TemporaryDirectory() as temporary:
+                records = Path(temporary)
+                listing = records / "files"
+                listing.write_bytes(b"".join(os.fsencode(name) + b"\0" for name in files))
+                # Keep file-level reuse while bypassing cross-version delta reconstruction.
+                subprocess.run(["rsync", "-aLc0", "--timeout=120", "-e", shlex.join(ssh),
+                                "--whole-file", "--copy-dest=.basis", f"--files-from={listing}",
+                                str(local_source) + "/", target],
+                               check=True, capture_output=True, text=True)
+                if source_identity(local_source) != source_record:
+                    raise RuntimeError("Source changed during deployment")
+                write_json(records / "SOURCE.json", source_record)
+                write_json(records / "SOURCE_FILES.json", files)
+                subprocess.run(["rsync", "-a", "--timeout=120", "-e", shlex.join(ssh),
+                                str(records / "SOURCE.json"), str(records / "SOURCE_FILES.json"), target],
+                               check=True, capture_output=True, text=True)
+        except Exception as error:
+            # Only discard staging before activation. An interrupted activation may still be running.
+            try:
+                subprocess.run([*remote, "rm -rf -- " + quoted_staging],
+                               check=True, capture_output=True, text=True, timeout=15)
+            except (OSError, subprocess.SubprocessError) as cleanup_error:
+                error.add_note(f"Could not remove incomplete source staging {staging}: {cleanup_error}")
+            raise
         call(site, "install_source", staging=str(staging), expected=source_record, timeout=120)
     return {"site": site.name, "directory": directory, "source": source_record,
             "remote": call(site, "info")}

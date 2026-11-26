@@ -12,7 +12,7 @@ import re
 import shutil
 from xml.etree import ElementTree as ET
 
-from .config import Config, DEFAULTS, INDENTATION_SETTINGS, RECTANGLE_SETTINGS
+from .config import Config, CONTI_PARAMETERS, DEFAULTS, INDENTATION_SETTINGS, RECTANGLE_SETTINGS
 from .data import last_macro_row, mesh_snapshots
 from .errors import ExpectedError
 from .files import digest, file_digest, locked, read_json
@@ -26,7 +26,7 @@ TARGETS = {
 }
 FIXED_SETTINGS = {"rows", "cols", "seed", "QDSD", "meshDiagonal", "energyFunction",
                   "bulkModulus", "boundary", "deformation", "startLoad", "loading",
-                  "reconnectionMethod", "initialMeshSha256"} | RECTANGLE_SETTINGS | INDENTATION_SETTINGS
+                  "reconnectionMethod", "initialMeshSha256"} | RECTANGLE_SETTINGS | INDENTATION_SETTINGS | CONTI_PARAMETERS
 DUMP = re.compile(r"(?:checkpoint_.*|dump_l.*)\.xml\.gz")
 NAMED_LOAD = re.compile(r"dump_l([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\.xml\.gz")
 VTU_STEP = re.compile(r".*\.(\d+)\.vtu")

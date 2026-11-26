@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .campaign import install_campaign_files, validate_campaign
-from .cluster import call, paths, require_available_output, submit
+from .cluster import paths, require_available_output, submit
 from .config import Config
 from .errors import ExpectedError
 from .files import read_json
@@ -55,7 +55,7 @@ def submit_run(site, config, *, state_dir, campaign="AdHoc", label=None, checkpo
     return {"config_hash": config.config_hash, "jobs": _jobs(result)}
 
 
-def submit_campaign(site, path, *, state_dir, chain=1, workers=2, log=None):
+def submit_campaign(site, path, *, state_dir, chain=1, workers=2, log=None, report_progress=None):
     """Submit a saved campaign and return jobs, completed skips and conflicts."""
     _check_chain(site, chain)
     if type(workers) is not int or workers < 1:
@@ -66,16 +66,15 @@ def submit_campaign(site, path, *, state_dir, chain=1, workers=2, log=None):
         companion = path.with_name(name)
         if companion.exists():
             records[name] = read_json(companion)
-    campaign, entries = validate_campaign(records["simulations.json"],
-                                         records.get("metadata.json", {}).get("missing_settings"))
-    if chain > 1 and any(not config["writeDumps"] for config, _ in entries):
-        raise ExpectedError("Enable writeDumps for every campaign member in a Slurm chain.")
+    campaign, entries, resources = campaign_plan(site, records, chain)
     install_campaign_files([records])
+    report_progress = report_progress or log
     if site.ssh:
-        call(site, "install_campaign_files", records=[records], log=log)
-    resources = records.get("resources.json", {}).get("resources", {})
+        from .campaign_batch import submit_remote_campaign
+        return submit_remote_campaign(site, records, campaign, state_dir=state_dir, chain=chain,
+                                      log=log, report_progress=report_progress)
     result = {"campaign": campaign, "jobs": [], "skipped": [], "conflicts": []}
-    if not site.ssh and site.mode == "foreground":
+    if site.mode == "foreground":
         attempts = []
         try:
             for config, label in entries:
@@ -97,10 +96,12 @@ def submit_campaign(site, path, *, state_dir, chain=1, workers=2, log=None):
         jobs = run_many([attempt for attempt, _ in attempts], workers) if attempts else []
         result["jobs"] = [job | member for job, (_, member) in zip(jobs, attempts, strict=True)]
     else:
-        for config, label in entries:
-            execution_site = replace(site, slurm=site.slurm | resources.get(str(config["rows"]), {}))
-            receipt = submit(execution_site, config, state_dir=state_dir, campaign=campaign,
-                             label=label, chain=chain, skip_completed=True, log=log)
+        count = len(entries)
+        if log:
+            log(f"{site.name.upper()}: submitting {count:,} campaign runs.")
+        for index, (config, label) in enumerate(entries, 1):
+            receipt = submit_member(site, campaign, config, label, resources,
+                                    state_dir=state_dir, chain=chain, log=log)
             member = {"label": label, "config_hash": config.config_hash}
             if receipt.get("skipped"):
                 result["skipped"].append(member)
@@ -108,4 +109,23 @@ def submit_campaign(site, path, *, state_dir, chain=1, workers=2, log=None):
                 result["conflicts"].append(member | {"conflict": receipt["conflict"]})
             else:
                 result["jobs"].extend(job | member for job in _jobs(receipt))
+            if report_progress and (index in (1, count) or index % 10 == 0):
+                report_progress(f"{site.name.upper()}: processed {index:,}/{count:,} runs. "
+                                f"Accepted jobs: {len(result['jobs']):,}. Already complete: {len(result['skipped']):,}. "
+                                f"Conflicts: {len(result['conflicts']):,}.")
     return result
+
+
+def campaign_plan(site, records, chain):
+    _check_chain(site, chain)
+    campaign, entries = validate_campaign(records["simulations.json"],
+                                         records.get("metadata.json", {}).get("missing_settings"))
+    if chain > 1 and any(not config["writeDumps"] for config, _ in entries):
+        raise ExpectedError("Enable writeDumps for every campaign member in a Slurm chain.")
+    return campaign, entries, records.get("resources.json", {}).get("resources", {})
+
+
+def submit_member(site, campaign, config, label, resources, *, state_dir, chain, log=None, on_site=False):
+    execution_site = replace(site, slurm=site.slurm | resources.get(str(config["rows"]), {}))
+    return submit(execution_site, config, state_dir=state_dir, campaign=campaign, label=label,
+                  chain=chain, skip_completed=True, log=log, on_site=on_site)

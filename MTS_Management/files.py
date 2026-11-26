@@ -33,6 +33,11 @@ def file_digest(path):
     return h.hexdigest()
 
 
+def attempt_directories(directory):
+    """Iterate attempt directories, ignoring filesystem metadata files."""
+    return (entry for entry in directory.iterdir() if entry.is_dir())
+
+
 def read_json(path):
     return json.loads(Path(path).read_text())
 

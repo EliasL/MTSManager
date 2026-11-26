@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 import re
+from xml.parsers import expat
 
 from .errors import ExpectedError
 from .files import digest
@@ -41,6 +42,30 @@ def mesh_snapshots(folder, *, through_step=None):
     if len({frame["step"] for frame in frames}) != len(frames):
         raise ValueError(f"Multiple mesh snapshots for the same load step in {folder}")
     return frames
+
+
+def vtu_fields(path):
+    """Read native VTU field names and component counts without loading mesh arrays."""
+    fields = {"cell": {}, "point": {}}
+    associations = {"CellData": "cell", "PointData": "point"}
+    stack = []
+
+    def start(tag, attrs):
+        if tag == "DataArray" and len(stack) >= 2 and stack[-2] == "Piece" and stack[-1] in associations:
+            name = attrs["Name"]
+            components = int(attrs.get("NumberOfComponents", 1))
+            group = fields[associations[stack[-1]]]
+            if components < 1 or (name in group and group[name] != components):
+                raise ValueError(f"Invalid VTU field declaration for {name!r} in {path}.")
+            group[name] = components
+        stack.append(tag)
+
+    parser = expat.ParserCreate()
+    parser.StartElementHandler = start
+    parser.EndElementHandler = lambda tag: stack.pop()
+    with Path(path).open("rb") as stream:
+        parser.ParseFile(stream)
+    return fields
 
 
 def seed_group_fields(settings):

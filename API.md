@@ -28,12 +28,21 @@ Use an enabled remote profile name in place of `local` to inspect that site.
 | Read or refresh inventory | `mts inventory-cache --site NAME` or `mts inventory --site NAME` | `MTS_Management.cluster.call(site, "inventory_cached")` or `call(site, "inventory")` |
 | Retrieve a run collection | `mts fetch HASH DESTINATION --site NAME` | `MTS_Management.cluster.fetch_many` |
 | Verify a local run folder | `mts inspect-run FOLDER` | `MTS_Management.run_records.read_run` |
+| List saved mesh fields | | `MTS_Management.data.vtu_fields` or `MTS_Management.cluster.call(site, "mesh_snapshots", folder=folder, manifest_sha256=checksum, fields=True)` |
+
+The remote field listing uses the latest saved mesh snapshot and returns cell
+and point field names with their component counts.
 
 The global `--sites` and `--state-dir` switches precede the subcommand.
 `mts COMMAND --help` lists command-specific options. The Python functions accept
 a `Site` from `load_sites`. The submission functions require a local
 `state_dir` for receipts. Use `submission_state_dir` to select the same
 default as the CLI.
+
+For an SSH site, `submit_campaign` starts one remote submission worker and
+polls for receipts. The worker can continue after the SSH session ends.
+Repeat the command with the same site, campaign and local state directory
+after losing contact to collect the existing batch's receipts.
 
 `validate-campaign` reports the verified members and planned folder names
 without registering the campaign or submitting jobs. `inspect-run` reports a

@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 from MTS_Management.config import DEFAULTS
-from MTS_Management.files import read_json
+from MTS_Management.files import attempt_directories, read_json
 
 ACTIONS = {"hold": "Hold queued jobs", "release": "Release user-held jobs", "cancel": "Cancel queued jobs"}
 CHOICES = {"reconnectionMethod": ["none", "edgeFlip", "delaunay"], "preconditioner": ["none", "exactTangent"],
@@ -110,7 +110,7 @@ def remote(payload):
             raise ValueError(f"Index/configuration mismatch: {folder}")
         if not matches(config, manifest, rule):
             continue
-        owned = any(str(read_json(a / "status.json").get("scheduler_id")) == job["job_id"] for a in (folder / "attempts").iterdir())
+        owned = any(str(read_json(a / "status.json").get("scheduler_id")) == job["job_id"] for a in attempt_directories(folder / "attempts"))
         if not owned:
             continue
         row = job | {"config_hash": config.config_hash, "folder": str(folder)}

@@ -16,6 +16,8 @@
   "bottom": "free",
   "boundary": "fixed",
   "bulkModulus": 4.0,
+  "conti_beta": 0.0,
+  "conti_kappa": 0.0,
   "checkpointInterval": 0,
   "cols": 3,
   "constitutiveReference": "areaNormalizedTriangular",

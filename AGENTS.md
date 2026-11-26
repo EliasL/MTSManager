@@ -25,6 +25,10 @@ that need it. Keep dependencies independent of SimulationScripts.
   identities are recorded separately. Never silently overwrite/resume another run.
 - All launch paths must record lifecycle events in the job journal. Preserve
   per-attempt logs and readable live `[tags]`.
+- Minimize SSH handshakes. For multi-run or long-running operations, send
+  the batch to MTSManager on the execution host and let it run locally.
+  Persist receipts there and poll sparingly. Verify uncertain submissions
+  before issuing another scheduler request.
 - Use dedicated current source/build/output directories on clusters. Never
   replace the shared legacy `~/simulation/MTS2D` checkout.
 - Keep inventory bounded and cached. Do not introduce exact recursive directory

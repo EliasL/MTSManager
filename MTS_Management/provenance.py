@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 
-from .config import DEFAULTS
+from .config import CONTI_PARAMETERS, DEFAULTS
 from .files import digest, file_digest, read_json, write_json, now, locked
 
 
@@ -172,12 +172,13 @@ def install_source(source, staging, expected):
     return expected
 
 
-def build(source, build_dir, *, jobs=2, native_arch=False, archive_dir=None):
+def build(source, build_dir, *, jobs=2, native_arch=False, archive_dir=None, expected_source_sha256=None):
     with locked(Path(source).resolve().parent / ".source.lock"):
-        return _build(source, build_dir, jobs=jobs, native_arch=native_arch, archive_dir=archive_dir)
+        return _build(source, build_dir, jobs=jobs, native_arch=native_arch, archive_dir=archive_dir,
+                      expected_source_sha256=expected_source_sha256)
 
 
-def _build(source, build_dir, *, jobs=2, native_arch=False, archive_dir=None):
+def _build(source, build_dir, *, jobs=2, native_arch=False, archive_dir=None, expected_source_sha256=None):
     source, build_dir = Path(source).resolve(), Path(build_dir).resolve()
     archive_dir = Path(archive_dir) if archive_dir else build_dir.parent / "executables"
     if jobs < 1:
@@ -193,10 +194,13 @@ def _build(source, build_dir, *, jobs=2, native_arch=False, archive_dir=None):
         if any(Path(paths[key]) != expected for key, expected in
                (("CMAKE_HOME_DIRECTORY", source), ("CMAKE_CACHEFILE_DIR", build_dir)) if key in paths):
             raise ValueError("CMake build was moved; preserve the old build directory and build in a fresh directory")
+    identity = source_identity(source)
+    if expected_source_sha256 is not None and identity["source_sha256"] != expected_source_sha256:
+        from .errors import ExpectedError
+        raise ExpectedError("The deployed source changed after the version check. Check the deployment and retry.")
+    verify_schema(source)
     if (build_dir / "MTS2D").exists():
         retain_executable(build_dir / "MTS2D", archive_dir)
-    identity = source_identity(source)
-    verify_schema(source)
     subprocess.run(["cmake", "-S", str(source), "-B", str(build_dir),
                     "-DCMAKE_BUILD_TYPE=Release",
                     "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
@@ -219,6 +223,8 @@ def _build(source, build_dir, *, jobs=2, native_arch=False, archive_dir=None):
         record["constrained_delaunay"] = True
     if subprocess.run([executable, "--supports-conti-2-phase"], capture_output=True).returncode == 0:
         record["conti_2_phase"] = True
+    if subprocess.run([executable, "--supports-triangular-cubic"], capture_output=True).returncode == 0:
+        record["triangular_cubic"] = True
     write_json(build_dir / "build-manifest.json", record)
     retain_executable(executable, archive_dir)
     return record
@@ -238,8 +244,15 @@ def executable_identity(executable):
 
 def supports_current_configuration(build):
     keys = build.get("configuration_keys_sha256")
-    return supports_initial_mesh(build) or keys == digest(sorted(DEFAULTS.keys() - {"initialMeshSha256"}))
+    return supports_initial_mesh(build) or keys in {
+        digest(sorted(DEFAULTS.keys() - {"initialMeshSha256"})),
+        digest(sorted(DEFAULTS.keys() - CONTI_PARAMETERS - {"initialMeshSha256"})),
+    }
 
 
 def supports_initial_mesh(build):
+    return supports_conti_parameters(build) or build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS.keys() - CONTI_PARAMETERS))
+
+
+def supports_conti_parameters(build):
     return build.get("configuration_keys_sha256") == digest(sorted(DEFAULTS))

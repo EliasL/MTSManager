@@ -13,16 +13,16 @@ import threading
 import time
 import uuid
 
-from .config import Config, validate_driven_edge
+from .config import Config, CONTI_PARAMETERS, validate_driven_edge
 from .data import last_macro_row
 from .errors import ExpectedError
-from .files import digest, file_digest, locked, now, read_json, write_json
+from .files import attempt_directories, digest, file_digest, locked, now, read_json, write_json
 from .initial_mesh import MESH_FILE, mesh_bytes, mesh_checksum, verify_mesh
 from .journal import Journal
 from .inventory_cache import invalidate as invalidate_inventory
 from .provenance import (
     executable_identity, scripts_identity, retain_executable,
-    supports_current_configuration, supports_initial_mesh,
+    supports_conti_parameters, supports_current_configuration, supports_initial_mesh,
 )
 from .run_records import read_run_for_execution
 
@@ -154,12 +154,16 @@ def find_fresh_conflict(output_root, config, label=None):
 
 
 def validate_execution_build(config, build):
+    if CONTI_PARAMETERS & config.as_dict().keys() and not supports_conti_parameters(build):
+        raise ExpectedError("Rebuild MTS2D at the execution site to use Conti material overrides.")
     if config["initialMeshSha256"] and not supports_initial_mesh(build):
         raise ExpectedError("Build MTS2D at the execution site to use a custom initial mesh.")
     if not supports_current_configuration(build):
         raise ExpectedError("Build MTS2D at the execution site to use the current configuration.")
     if config["energyFunction"] == "conti2Phase" and not build.get("conti_2_phase"):
         raise ExpectedError("Rebuild MTS2D at the execution site to use Conti2Phase.")
+    if config["energyFunction"] == "triangularCubic" and not build.get("triangular_cubic"):
+        raise ExpectedError("Rebuild MTS2D at the execution site to use triangularCubic.")
     if (config["reconnectionMethod"] == "delaunay" and
             (config["boundary"] not in {"periodic", "periodicAnchored"} or
              config["initialMeshSha256"] or min(config["rows"], config["cols"]) < 3) and
@@ -186,7 +190,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             prior = root / index[config.config_hash] / "attempts"
             if resume_selection is not None and not prior.is_dir():
                 raise ExpectedError("The run's attempt records are missing. Refresh Monitor data.")
-            requests = [read_json(p / "request.json") for p in prior.iterdir()]
+            requests = [read_json(p / "request.json") for p in attempt_directories(prior)]
             if requests:
                 executable = max(requests, key=lambda r: r["created_at"])["executable"]
     output_root = Path(output_root).resolve()
@@ -218,7 +222,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             if str(folder) != resume_selection["folder"] or not matches:
                 raise ExpectedError("The run is no longer registered here. Refresh Monitor data.")
             with source_run(output_root, resume_selection, verify_inactive=True) as (_, saved):
-                attempts = (folder / "attempts").iterdir()
+                attempts = attempt_directories(folder / "attempts")
                 latest = max(attempts, key=lambda a: read_json(a / "request.json")["created_at"], default=None)
                 if latest is None or attempt_status(latest)["state"] not in {"failed", "stopped"}:
                     raise ExpectedError("Select a run whose latest attempt failed or stopped.")
@@ -230,7 +234,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
         if after:
             if not resume_latest or after.parent != folder / "attempts":
                 raise ValueError("A continuation must resume the same run's latest checkpoint")
-            attempts = sorted((folder / "attempts").iterdir(),
+            attempts = sorted(attempt_directories(folder / "attempts"),
                               key=lambda a: read_json(a / "request.json")["created_at"])
             if after != attempts[-1] or not read_json(after / "status.json").get("scheduler_id"):
                 raise ValueError("Chain predecessor must be the latest submitted Slurm attempt")
@@ -239,7 +243,7 @@ def prepare(config, *, executable, output_root, state_dir, campaign="AdHoc", lab
             saved, old = read_run_for_execution(folder)
             if saved.config_hash != config.config_hash or saved.as_dict() != config.as_dict():
                 raise ValueError(f"Run manifest/configuration mismatch: {folder}")
-            previous_statuses = [attempt_status(a) for a in (folder / "attempts").iterdir()]
+            previous_statuses = [attempt_status(a) for a in attempt_directories(folder / "attempts")]
             if checkpoint is None and not resume_latest:
                 if skip_completed and not any(status["state"] in ACTIVE for status in previous_statuses) and completed_run(folder, saved):
                     return None

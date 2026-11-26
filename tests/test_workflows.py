@@ -69,6 +69,62 @@ class DeploymentTests(unittest.TestCase):
         fixture.start()
         self.addCleanup(fixture.stop)
 
+    def test_campaign_reconnect_collects_receipts_from_the_same_batch(self):
+        from MTS_Management.errors import ExpectedError
+        from MTS_Management.submission import submit_campaign
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "simulations.json"
+            config = Config()
+            write_json(path, {"name": "Sweep", "runs": [{"label": "Run0", "settings": config.as_dict()}]})
+            remote = Journal(root / "remote")
+            request = remote.append("submission_requested", label="Run0", config_hash=config.config_hash)
+            remote.append("submission_accepted", submission_id=request["event_id"],
+                          scheduler_id="37869", campaign="Sweep")
+            site = Site(name="cluster", ssh="cluster", mode="slurm")
+            progress = []
+            with patch("MTS_Management.submission.install_campaign_files"), \
+                    patch("MTS_Management.campaign_batch.sync_journals"), \
+                    patch("MTS_Management.campaign_batch.call", side_effect=[
+                        ConnectionError("SSH connection reset"),
+                        {"state": "complete", "total": 1, "checked": 1, "receipts": remote.records()},
+                    ]) as transport:
+                with self.assertRaisesRegex(ExpectedError, "reconnect to the same batch"):
+                    submit_campaign(site, path, state_dir=root)
+                result = submit_campaign(site, path, state_dir=root, report_progress=progress.append)
+            self.assertIn("processed 1/1 runs", progress[-1])
+            self.assertEqual([job["scheduler_id"] for job in result["jobs"]], ["37869"])
+            self.assertEqual([call.args[1] for call in transport.call_args_list],
+                             ["campaign_batch_start", "campaign_batch_start"])
+            self.assertEqual(transport.call_args_list[0].kwargs["batch"], transport.call_args_list[1].kwargs["batch"])
+            self.assertTrue(any(record.get("scheduler_id") == "37869" for record in Journal(root).records()))
+
+    def test_build_servers_skips_outdated_and_retained_targets(self):
+        from MTS_Management.deployments import build_servers
+
+        primary = {"source": "/work/source", "executable": "/work/build/MTS2D", "retained": False}
+        retained = primary | {"executable": "/work/executables/pin/MTS2D", "retained": True}
+        targets = {"first": primary, "shared": primary, "pilot": retained}
+        def check(profiles, expected):
+            if profiles[0].ssh == "outdated":
+                return {"state": "mismatch"}
+            return {"state": "current", "profiles": {
+                site.name: {"build_target": targets[site.name]} for site in profiles}}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sites = Path(temporary) / "sites.toml"
+            sites.write_text('[sites.first]\nssh="cluster"\n[sites.shared]\nssh="cluster"\n'
+                             '[sites.pilot]\nssh="cluster"\n[sites.old]\nssh="outdated"\n')
+            with patch("MTS_Management.deployments.deployment_expectation", return_value={"source": "current"}), \
+                    patch("MTS_Management.deployments.check_deployment", side_effect=check), \
+                    patch("MTS_Management.deployments.call") as build:
+                result = build_servers(sites, log=lambda _: None)
+            self.assertEqual(result["built_sites"], ["first", "shared"])
+            self.assertCountEqual(result["skipped_sites"], ["pilot", "old"])
+            self.assertEqual(result["errors"], {})
+            self.assertEqual([args[0].name for args, _ in build.call_args_list], ["first"])
+
     def test_large_request_survives_polling_before_remote_reads_stdin(self):
         # SSH setup can exceed the polling interval before reading campaign JSON.
         popen = subprocess.Popen
@@ -111,6 +167,40 @@ class DeploymentTests(unittest.TestCase):
                 result = update_managers(sites, log=lambda _: None)
                 self.assertEqual(result["updated_sites"], ["cluster"])
                 self.assertEqual(transferred, [b"src/main.cpp\0"])
+
+    def test_shared_source_transfer_failure_is_reported_once(self):
+        from MTS_Management.deployments import update_managers
+        from MTS_Management.errors import ExpectedError
+        from MTS_Management.provenance import scripts_identity
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sites = Path(temporary) / "sites.toml"
+            sites.write_text('[sites.cluster]\nssh="cluster"\ndirectory="/work/MTS"\n'
+                             '[sites.pilot]\nssh="cluster"\ndirectory="/work/MTS"\n')
+            uploads = []
+            cleanups = []
+
+            def transport(command, **kwargs):
+                if any(argument.startswith("--files-from=") for argument in command):
+                    uploads.append(command)
+                    diagnostic = "rsync: write failed: Disk quota exceeded"
+                    raise subprocess.CalledProcessError(
+                        23, command, stderr=diagnostic if kwargs.get("capture_output") else None)
+                if command[-1].startswith("rm -rf -- "):
+                    cleanups.append(command[-1])
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch("MTS_Management.deployments.subprocess.run", side_effect=transport), \
+                    patch("MTS_Management.deployments.call", return_value={"scripts": scripts_identity()}), \
+                    patch("MTS_Management.deployments.source_identity", return_value={"revision": "fixture"}), \
+                    patch("MTS_Management.cluster.source_identity", return_value={"revision": "fixture"}), \
+                    patch("MTS_Management.cluster.source_files", return_value=["src/main.cpp"]):
+                with self.assertRaisesRegex(ExpectedError, "CLUSTER, PILOT:") as error:
+                    update_managers(sites, force=True, log=lambda _: None)
+            self.assertEqual(str(error.exception).count("Disk quota exceeded"), 1)
+            self.assertEqual(len(uploads), 1)
+            self.assertIn("--whole-file", uploads[0])
+            self.assertEqual(len(cleanups), 1)
 
     def test_servers_update_concurrently_and_share_uploads_within_each_host(self):
         from MTS_Management.deployments import update_managers
@@ -252,6 +342,7 @@ print("finished",flush=True)
 
     def test_inventory_cache_reuses_finished_runs_until_resume_or_hard_refresh(self):
         attempt = self.prepare()
+        (attempt.parent / ".DS_Store").write_bytes(b"Finder metadata")
         with redirect_stdout(io.StringIO()):
             execute(attempt)
         with patch("MTS_Management.inventory.read_json", wraps=read_json) as read:
@@ -350,6 +441,8 @@ print("finished",flush=True)
         self.assertEqual(inventory(self.output)[0]["status"]["state"], "prepared")
 
     def test_site_build_setting_and_cache_override(self):
+        from MTS_Management.errors import ExpectedError
+
         cache = self.exe.parent / "CMakeCache.txt"
         cache.write_text("ENABLE_NATIVE_ARCH:BOOL=ON\n")
 
@@ -357,12 +450,15 @@ print("finished",flush=True)
             if "-S" in args:
                 option = next(a for a in args if a.startswith("-DENABLE_NATIVE_ARCH="))
                 cache.write_text("ENABLE_NATIVE_ARCH:BOOL=" + option.split("=", 1)[1] + "\n")
+            return subprocess.CompletedProcess(args, 0)
 
-        with patch("MTS_Management.provenance.source_identity", return_value={"branch": "main"}), \
+        with patch("MTS_Management.provenance.source_identity", return_value={"branch": "main", "source_sha256": "current"}), \
              patch("MTS_Management.provenance.verify_schema"), \
              patch("MTS_Management.provenance.subprocess.run", side_effect=cmake):
+            with self.assertRaisesRegex(ExpectedError, "changed after the version check"):
+                build(self.root, self.exe.parent, expected_source_sha256="older")
             # The portable default must replace an existing native build's cache setting.
-            record = build(self.root, self.exe.parent)
+            record = build(self.root, self.exe.parent, expected_source_sha256="current")
             self.assertEqual(record["build_options"]["ENABLE_NATIVE_ARCH"], "OFF")
             record = build(self.root, self.exe.parent, native_arch=True)
             self.assertEqual(record["build_options"]["ENABLE_NATIVE_ARCH"], "ON")
@@ -643,6 +739,42 @@ print("finished",flush=True)
         with patch("MTS_Management.cluster.source_identity", return_value={"revision": "test"}):
             with self.assertRaisesRegex(ValueError, "dedicated"):
                 deploy(site, include_source=True, local_source=self.root)
+
+    def test_remote_campaign_worker_survives_request_and_reuses_batch_id(self):
+        shutil.copytree(PACKAGE_ROOT / "MTS_Management", self.root / "MTS_Management",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        calls = self.root / "sbatch.log"
+        sbatch = bin_dir / "sbatch"
+        sbatch.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$MTS_TEST_SBATCH_LOG"\nprintf "12345\\n"\n')
+        sbatch.chmod(0o755)
+        env = os.environ | {"PYTHONPATH": str(self.root), "MTS_TEST_SBATCH_LOG": str(calls),
+                            "PATH": os.pathsep.join((str(bin_dir), os.environ["PATH"]))}
+        site = Site(name="cluster", ssh="cluster", mode="slurm", directory=str(self.root),
+                    executable=str(self.exe), output_root=str(self.output), state_dir=str(self.state))
+        config = Config()
+        records = {"simulations.json": {"name": "Sweep", "runs": [{"label": "First", "settings": config.as_dict()}]},
+                   "resources.json": {"resources": {str(config["rows"]): {"mem": "12G"}}}}
+        batch = "5" * 32
+
+        def request(operation, **options):
+            payload = {"site": asdict(site), "operation": operation, "options": options | {"batch": batch}}
+            response = subprocess.run([sys.executable, "-P", "-m", "MTS_Management", "_serve"],
+                                      input=json.dumps(payload), capture_output=True, text=True,
+                                      check=True, env=env, timeout=10)
+            return json.loads(response.stdout)
+
+        self.assertEqual(request("campaign_batch_start", records=records, chain=1)["state"], "running")
+        deadline = time.monotonic() + 10
+        while (status := request("campaign_batch_status"))["state"] == "running" and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual(status["state"], "complete", status)
+        self.assertEqual([entry["scheduler_id"] for entry in status["receipts"]
+                          if entry["event"] == "submission_accepted"], ["12345"])
+        self.assertEqual(request("campaign_batch_start", records=records, chain=1), status)
+        self.assertEqual(len(calls.read_text().splitlines()), 1)
+        self.assertIn("--mem=12G", calls.read_text())
 
     def test_stale_slurm_attempt_can_be_stopped_without_inventing_success(self):
         attempt = self.prepare()
